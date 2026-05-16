@@ -271,4 +271,28 @@ report_path = build_backtest_report(
     output_path='slope_backtest_report.html', auto_open=True)
 print(f"[報表] 已輸出：{report_path}")
 
+# ── 更新今日訊號至資料庫 ──────────────────────────────────────────────────────
+# 來源與報表「最新訊號」tab 相同：signal_data 最後一日、指數成份股（weight_ 非空）、有效斜率
+latest_date = signal_data['date'].max()
+latest_sig  = (signal_data
+               .loc[(signal_data['date'] == latest_date) & signal_data['weight_'].notna(),
+                    ['date', 'stk_bbg', 'signal', 'indicator']]
+               .dropna(subset=['indicator'])
+               .copy())
+df_sql    = my_func.prepare_df_for_sql(latest_sig, stg_ID, group_, 'indicator')
+today_str = df_sql['date_'].iloc[0]
+
+trans = conn.begin()
+try:
+    conn.execute(
+        sqlalchemy.text("DELETE FROM qt_signal WHERE date_ = :d AND stg_id = :s"),
+        {'d': today_str, 's': stg_ID})
+    df_sql.to_sql('qt_signal', conn, if_exists='append', index=False)
+    trans.commit()
+    print(f"[資料庫] 訊號已更新 {len(df_sql)} 筆（{today_str}）")
+except Exception as e:
+    trans.rollback()
+    print(f"[資料庫] 訊號寫入失敗: {e}")
+    raise
+
 conn.close()
