@@ -53,6 +53,70 @@ def df_to_html_table(df, classes='data-table'):
     return df.to_html(classes=classes, index=False, escape=False, border=0)
 
 
+def _fmt_attr_cell(v, digits):
+    if pd.isna(v):
+        return '<span style="color:#bbb">n/a</span>'
+    if v == 0:
+        return '0'
+    return f'{v:+.{digits}f}'
+
+
+def _build_expandable_attribution_table(sector_df, bb_securities, held_only=False, table_id='attr-table'):
+    """
+    建可展開的歸因表:
+      - 第一層: sector 列, 可點擊
+      - 第二層: 該 sector 下的個股, 預設隱藏
+      - held_only=True: 第二層只顯示組合有持有的個股 (wt_port > 0)
+    """
+    cols = [
+        ('wt_port', 'wP%', 2),
+        ('wt_bench', 'wB%', 2),
+        ('wt_active', 'wActive%', 2),
+        ('tr_port', 'rP%', 2),
+        ('tr_bench', 'rB%', 2),
+        ('tr_active', 'rActive%', 2),
+        ('industry_active', '產業報酬', 3),
+        ('sel_active', '個股選擇', 3),
+        ('ctr_active', 'CTR', 3),
+    ]
+    sd = sector_df.copy().sort_values('ctr_active', ascending=False).reset_index(drop=True)
+
+    html = [f'<table class="data-table expandable-table" id="{table_id}">']
+    html.append('<thead><tr>')
+    html.append('<th>Sector / 證券</th>')
+    for _, hdr, _ in cols:
+        html.append(f'<th>{hdr}</th>')
+    html.append('</tr></thead>')
+    html.append('<tbody>')
+
+    for _, srow in sd.iterrows():
+        sector_name = str(srow['name'])
+        sid = sector_name.replace(' ', '_')  # 用作 data-attribute id
+        # Sector 列
+        html.append(f'<tr class="sector-row" data-sector="{sid}">')
+        html.append(f'<td><span class="toggle">▶</span> <strong>{sector_name}</strong></td>')
+        for col, _, digits in cols:
+            html.append(f'<td>{_fmt_attr_cell(srow[col], digits)}</td>')
+        html.append('</tr>')
+
+        # 該 sector 下的證券, 按 |ctr_active| 大到小排; held_only 時只留 wt_port>0
+        sec_in_sec = bb_securities[bb_securities['sector'] == sector_name].copy()
+        if held_only:
+            sec_in_sec = sec_in_sec[sec_in_sec['wt_port'].notna() & (sec_in_sec['wt_port'] > 0)]
+        sec_in_sec['_abs_ctr'] = sec_in_sec['ctr_active'].abs()
+        sec_in_sec = sec_in_sec.sort_values('_abs_ctr', ascending=False, na_position='last')
+        for _, secr in sec_in_sec.iterrows():
+            html.append(f'<tr class="sec-detail" data-parent="{sid}" style="display:none">')
+            sec_name = str(secr['name'])
+            html.append(f'<td style="padding-left:36px; color:#5D6D7E">└ {sec_name}</td>')
+            for col, _, digits in cols:
+                html.append(f'<td>{_fmt_attr_cell(secr[col], digits)}</td>')
+            html.append('</tr>')
+
+    html.append('</tbody></table>')
+    return '\n'.join(html)
+
+
 # =============================================================
 # Chart builders
 # =============================================================
@@ -335,32 +399,41 @@ def chart_sector_returns(sector_df):
 
 
 def chart_attribution_waterfall(perf):
-    # Active = 產業報酬 + 個股選擇 (Timing 已於資料載入時移除)
-    items = [
-        ('產業報酬', perf['industry_active'] or 0),
-        ('個股選擇報酬', perf['selection_active'] or 0),
-        ('Active Return', perf['active_return'] or 0),
+    # 5 根 bar: 指數 / 投組 / Active / 產業配置 / 個股選擇 (Timing 已剔除)
+    # 投組 = 指數 + Active; Active = 產業配置 + 個股選擇
+    labels = ['指數報酬<br>(SPY)', '投組報酬<br>(TWRR)', 'Active Return',
+              '└─ 產業配置報酬', '└─ 個股選擇報酬']
+    values = [
+        (perf['spy_return'] or 0) * 100,
+        (perf['port_return'] or 0) * 100,
+        (perf['active_return'] or 0) * 100,
+        (perf['industry_active'] or 0) * 100,
+        (perf['selection_active'] or 0) * 100,
     ]
-    measures = ['relative', 'relative', 'total']
-    fig = go.Figure(go.Waterfall(
-        name='Bloomberg Attribution',
-        orientation='v',
-        measure=measures,
-        x=[i[0] for i in items],
-        y=[i[1]*100 for i in items],
-        text=[f'{v*100:+.2f}%' for _, v in items],
-        textposition='outside',
-        connector={'line': {'color': '#BDBDBD'}},
-        increasing={'marker': {'color': COLOR_POS}},
-        decreasing={'marker': {'color': COLOR_NEG}},
-        totals={'marker': {'color': COLOR_PORT}},
+    # 顏色與下方 sector 細項圖一致: 產業配置=COLOR_INFO, 個股選擇=COLOR_ACCENT
+    colors = [COLOR_BENCH, COLOR_PORT, COLOR_PURPLE, COLOR_INFO, COLOR_ACCENT]
+
+    fig = go.Figure(go.Bar(
+        x=labels, y=values, marker_color=colors,
+        text=[f'{v:+.2f}%' for v in values], textposition='outside',
+        cliponaxis=False,
+        hovertemplate='%{x}: %{y:+.2f}%<extra></extra>',
     ))
+    y_max = max(values)
+    y_min = min(0, min(values))
+    pad = (y_max - y_min) * 0.18
     fig.update_layout(
-        title='Bloomberg 歸因瀑布圖 (Active Return 拆解)',
-        yaxis_title='貢獻 (%)', yaxis_ticksuffix='%',
+        title='Bloomberg 歸因: 投組 = 指數 + Active = 指數 + 產業配置 + 個股選擇',
+        yaxis_title='報酬 (%)', yaxis_ticksuffix='%',
+        yaxis_range=[y_min - pad, y_max + pad],
         template=PLOTLY_TEMPLATE, font=CHART_FONT, height=480,
-        margin=dict(t=60, b=60, l=60, r=40),
+        showlegend=False, margin=dict(t=70, b=70, l=60, r=40),
     )
+    # 在 Active 與其拆解之間加分隔線
+    fig.add_vline(x=2.5, line_dash='dot', line_color='#BBBBBB', line_width=1)
+    fig.add_annotation(x=3.5, y=y_max + pad*0.5,
+                       text='Active Return 拆解 ↓',
+                       showarrow=False, font=dict(size=11, color='#7F8C8D'))
     return fig
 
 
@@ -524,14 +597,13 @@ def build_html(d, results):
         bot10_disp[c] = bot10_disp[c].apply(lambda x: fmt_usd(x, 0))
     bot10_html = df_to_html_table(bot10_disp)
 
-    sec_attr_table = sector_df[['name', 'wt_port', 'wt_bench', 'wt_active',
-                                 'tr_port', 'tr_bench', 'tr_active',
-                                 'industry_active', 'sel_active', 'ctr_active']].copy()
-    sec_attr_table.columns = ['Sector', 'wP%', 'wB%', 'wActive%', 'rP%', 'rB%', 'rActive%',
-                                '產業報酬', '個股選擇', 'CTR']
-    for c in sec_attr_table.columns[1:]:
-        sec_attr_table[c] = sec_attr_table[c].apply(lambda x: f'{x:+.3f}' if pd.notna(x) else 'n/a')
-    sec_attr_table_html = df_to_html_table(sec_attr_table)
+    # 可展開的 sector → 證券 細項表 (兩個版本)
+    sec_attr_held_html = _build_expandable_attribution_table(
+        sector_df, d['bb_securities'], held_only=True, table_id='attr-table-held'
+    )
+    sec_attr_table_html = _build_expandable_attribution_table(
+        sector_df, d['bb_securities'], held_only=False, table_id='attr-table-all'
+    )
 
     # End holdings full table
     end_holdings = holdings['held_sorted'][['ticker', 'STK_NAME', 'TOTAL_SHARES', 'TOTAL_COST',
@@ -551,15 +623,15 @@ def build_html(d, results):
 
     # Tabs definition
     tabs = [
-        ('overview', '0. 概覽'),
-        ('daily', '1. 每日走勢'),
-        ('contrib', '2. 貢獻者'),
-        ('top_holdings', '3. Top 持股'),
-        ('sector', '4. 產業曝險'),
-        ('attribution', '5. Bloomberg 歸因'),
-        ('trading', '6. 交易分析'),
-        ('quant_edge', '7. 量化 Edge'),
-        ('notes', '8. 說明'),
+        ('overview', '概覽'),
+        ('daily', '每日走勢'),
+        ('contrib', '貢獻者'),
+        ('top_holdings', 'Top 持股'),
+        ('sector', '產業曝險'),
+        ('attribution', 'Brinson 歸因'),
+        ('trading', '交易分析'),
+        ('quant_edge', '量化 Edge'),
+        ('notes', '說明'),
     ]
 
     plotly_cdn = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>'
@@ -791,7 +863,7 @@ def build_html(d, results):
 <h3>Active Return 拆解瀑布圖</h3>
 {divs['waterfall']}
 <p class="narrative">
-    Bloomberg 歸因把 Active Return 拆成兩個來源:<br>
+    Brinson 歸因把 Active Return 拆成兩個來源:<br>
     <strong>產業報酬 ({fmt_pct(perf['industry_active'])})</strong>:
     產業權重 vs SPY 的差異所產生的貢獻 (Allocation/Factor 效果)。<br>
     <strong>個股選擇報酬 ({fmt_pct(perf['selection_active'])})</strong>:
@@ -800,10 +872,18 @@ def build_html(d, results):
 
 <h3>各 Sector 細項拆解</h3>
 {divs['sec_attr']}
-<h3>各 Sector 細項表</h3>
+
+<h3>持股細項表 (僅顯示組合有持有的個股, 點 sector 列展開)</h3>
+{sec_attr_held_html}
+<p class="narrative method-note">
+    點任一 sector 列可展開該產業內<strong>組合有持有</strong>的個股 (wt_port &gt; 0)。
+    用來聚焦「我們實際投入的部位對 Active 的貢獻」。
+</p>
+
+<h3>完整細項表 (含所有 SPY 成分股, 點 sector 列展開)</h3>
 {sec_attr_table_html}
 <p class="narrative method-note">
-    產業報酬 / 個股選擇 兩項對應每個 sector 對 Active 的拆解貢獻 (% 點)。
+    展開後顯示該 sector 內<strong>所有 SPY 成分股</strong> (含我們未持有的)。
     CTR (Contribution to Return) = 該 sector 對 Active 的總貢獻 ≈ 產業報酬 + 個股選擇。
 </p>
 """
@@ -1101,106 +1181,78 @@ def build_html(d, results):
         quant_edge_html = '<p>無 Bloomberg 證券層資料, 無法產生量化 Edge 分析。</p>'
 
     notes_html = f"""
-<h3>名詞解釋</h3>
+<h3>名詞速查 (本期數值)</h3>
+
 <dl class="glossary">
 
-<dt>組合報酬 (Bloomberg TWRR) — 本期 {fmt_pct(perf['port_return'])}</dt>
+<dt>組合報酬 (Bloomberg TWRR) — {fmt_pct(perf['port_return'])}</dt>
 <dd>
-<strong>Time-Weighted Rate of Return (時間加權報酬率, 每日複利版)</strong>:<br>
-<code>R = ∏ (1 + r_i) − 1</code>, 其中 r_i 為每日報酬, <code>r_i = (MV_i − MV_{{i−1}} − CF_i) / MV_{{i−1}}</code><br>
-逐日計算當日報酬率 (扣除當日 cash flow), 然後把所有日報酬複利相乘。<br>
-<strong>特性</strong>:
-<ul>
-  <li>需要逐日 MV 資料 (Bloomberg 有 daily snapshot)</li>
-  <li>真實反映「報酬路徑」(每日波動都納入)</li>
-  <li>完全扣除 cash flow 時點影響 — 不會因「期初買大量」而扭曲</li>
-  <li>業界績效比較的標準口徑 (GIPS 規範採用)</li>
+Bloomberg 用<strong>每日 MV</strong> 計算的真實時間加權報酬率, 把每日報酬複利相乘。<br>
+業界 GIPS 標準, 可直接跟 SPY 比較。<br>
+<strong>對外公布以此為準</strong>。
+</dd>
+
+<dt>Modified Dietz (自算近似) — {fmt_pct(perf.get('md_return'))}</dt>
+<dd>
+公式: <code>(V_end − V_start − Σ CF) / (V_start + Σ w<sub>i</sub> CF<sub>i</sub>)</code><br>
+只需期初/期末 MV + 各 CF 日期金額, 簡單快速但<strong>假設報酬均勻分布</strong>。<br>
+波動大時會略偏離 Bloomberg TWRR — 本期 MD 比 TWRR 高 {fmt_pct((perf.get('md_return') or 0) - perf['port_return'])}, 因 5 月有峰值後回吐, MD 看不到此非線性路徑。<br>
+<strong>用途: 內部快速估算</strong>。
+</dd>
+
+<dt>簡單法 — {fmt_pct(perf.get('simple_return'))}</dt>
+<dd>
+<code>總 P&L ÷ 額度 $665M (固定分母)</code><br>
+反映<strong>核給額度的資金 ROI</strong>, 不適合與 SPY 直接比較 (因 SPY 是 TWRR 口徑)。
+</dd>
+
+<dt>SPY 基準 — {fmt_pct(perf['spy_return'])}</dt>
+<dd>State Street SPDR S&P 500 ETF 的期間 TWRR (Bloomberg 提供)。</dd>
+
+<dt>Active Return — {fmt_pct(perf['active_return'])}</dt>
+<dd>
+<code>Active = 組合 − SPY = 產業報酬 + 個股選擇報酬</code> (Timing 已剔除)<br>
+本期 = {fmt_pct(perf['industry_active'])} + {fmt_pct(perf['selection_active'])} = <strong>{fmt_pct(perf['active_return'])}</strong>
+</dd>
+
+<dt>產業報酬 (Factor) — {fmt_pct(perf['industry_active'])}</dt>
+<dd>
+<strong>「對產業的超配/低配決策」的貢獻</strong> — 含 Brinson 的 Allocation + Interaction 效果。<br>
+本期主要靠重押 IT (vs SPY +29 pp 超配) 且 IT 大漲, 加上低配 Financials/Energy 等沒拖累。<br>
+<strong>是本期 Active 的主力 alpha 來源。</strong>
+</dd>
+
+<dt>個股選擇報酬 (Selection) — {fmt_pct(perf['selection_active'])}</dt>
+<dd>
+<strong>「在各產業內挑的個股相對該產業平均的殘餘差異」</strong>。<br>
+公式: <code>Σ w<sub>B,i</sub> × (r<sub>P,i</sub> − r<sub>B,i</sub>)</code>
+
+<div style="background:#FFF8E1; border-left:4px solid {COLOR_ACCENT}; padding:10px 14px; margin-top:10px; border-radius:4px;">
+<strong>★ 關鍵釐清: 為何 Selection 會是負, 但 IT 持股明顯跑贏?</strong><br><br>
+你的觀察沒錯 — IT 持股 (SNDK / MU / WDC) 加權平均 +77.6%, 大幅超越 SPY IT 平均 +23.8% 與大盤 +11.2%。<br><br>
+但 Bloomberg 把<strong>「超配 + 超額」這個乘積效果 (Interaction) 全部歸進「產業報酬 Factor」</strong>, 不歸進 Selection。<br><br>
+以 IT 為例 (對 Active 的 CTR = +39.52%):
+<ul style="margin:6px 0">
+  <li>經典 Brinson 拆解: Allocation +3.6% / Selection +18.4% / Interaction +15.4%</li>
+  <li>Bloomberg 拆解: <strong>Factor +43.3%</strong> / Selection -3.8% / Timing +0.4%</li>
 </ul>
+你的「持股選對 + 超配對的產業」的功勞絕大部分計入 <strong>Factor</strong>, Selection 變成扣除後的小殘餘。<br><br>
+<strong>結論</strong>: 看 <strong>CTR (Contribution to Return)</strong> 才是真實貢獻; 不必糾結 Factor / Selection 間的拆解分配。
+</div>
 </dd>
 
-<dt>Modified Dietz (自算近似) — 本期 {fmt_pct(perf.get('md_return'))}</dt>
+<dt>Active Share — {fmt_pct(perf.get('active_share'), 1, sign=False)}</dt>
 <dd>
-<strong>Modified Dietz 公式 (TWRR 的單期近似)</strong>:<br>
-<code>R = (V_end − V_start − Σ CF) / (V_start + Σ w_i · CF_i)</code><br>
-其中 w_i = (T − t_i) / T, T 為期間總天數, t_i 為第 i 筆 CF 距期初天數。<br>
-分子: 期末 MV − 期初 MV − 期內所有現金流, 即「純粹由報酬產生的 MV 變動」<br>
-分母: 期初 MV + 各 CF 按時間加權後的金額, 即「期間平均運用資金」<br>
-<strong>特性</strong>:
-<ul>
-  <li>只需要期初、期末 MV + 各 CF 的金額與日期</li>
-  <li>每筆 CF 視為對「stock-portfolio 帳戶」的外部現金流</li>
-  <li>假設報酬在期間內呈線性/均勻 — 是 TWRR 的<strong>單期近似</strong></li>
-  <li>無法捕捉期內 MV 的非線性波動</li>
-</ul>
+<code>½ × Σ |w<sub>port</sub> − w<sub>bench</sub>|</code> — 衡量組合結構與 SPY 的差異。<br>
+0% = 完全複製; 100% = 完全不同; 學術 > 60% 才有 alpha 潛力。本期屬於<strong>真主動管理</strong>。
 </dd>
 
-<dt>兩者差異與本期數據解讀</dt>
+<dt>有效持股數 N<sub>eff</sub> — {holdings['eff_n']:.1f}</dt>
 <dd>
-<table class="data-table" style="margin-top:6px;">
-<tr><th></th><th>Bloomberg TWRR</th><th>Modified Dietz</th></tr>
-<tr><td>資料需求</td><td>每日 MV (108 天 snapshot)</td><td>期初/期末 MV + 各 CF 日期金額</td></tr>
-<tr><td>計算方式</td><td>每日報酬複利</td><td>單期分子÷時間加權分母</td></tr>
-<tr><td>對波動敏感度</td><td>完整捕捉路徑波動</td><td>假設均勻成長, 對波動不敏感</td></tr>
-<tr><td>準確度</td><td>精確 (業界標準)</td><td>近似 (CF 集中且波動大時誤差較大)</td></tr>
-<tr><td>本期結果</td><td><strong>{fmt_pct(perf['port_return'])}</strong></td><td>{fmt_pct(perf.get('md_return'))}</td></tr>
-</table>
-<br>
-<strong>為何本期兩者相差約 {fmt_pct((perf.get('md_return') or 0) - perf['port_return'])}?</strong><br>
-1 月集中部署 $631M (期初一次到位), 之後組合 MV 一路上漲至 5 月初峰值約 $1B, 然後 5 月中下旬回落至期末 $683M (peak-to-end 回吐約 32%)。
-Modified Dietz 假設報酬均勻分散在 150 天, 因此忽略了「峰值在 5 月初、之後回吐」的非線性路徑;
-Bloomberg TWRR 逐日複利, 完整反映此波動 — 因此 MD 略<strong>高估</strong>真實時間加權績效。<br>
-實務上以 <strong>Bloomberg TWRR 為準</strong>; Modified Dietz 為內部快速試算的近似法, 兩者通常相差 0.5~3 pp 視 CF 集中度與波動而定。
+<code>N<sub>eff</sub> = 1 ÷ Σ(w<sub>i</sub><sup>2</sup>)</code>; 等權 N 檔 → N<sub>eff</sub> = N。<br>
+名義 {holdings['n_held_end']} 檔, 因集中度有效約 {holdings['eff_n']:.1f} 檔 (= 等權持有 {holdings['eff_n']:.1f} 檔的分散度)。
 </dd>
 
-<dt>Active Share — 本期 {fmt_pct(perf.get('active_share'), 1, sign=False)}</dt>
-<dd>Active Share = ½ × Σ |w_port,i − w_bench,i|。0% = 完全複製指數, 100% = 跟指數完全不同。本報告由 Bloomberg "活絡權重" 推算: 平均 |活絡| / 2。 學術: > 60% 才有 alpha 潛力; > 80% 為高度主動。</dd>
-
-<dt>有效持股數 N_eff — 本期 {holdings['eff_n']:.1f}</dt>
-<dd>N_eff = 1 / Σ(w_i²)。等權 N 檔 → N_eff = N; 越集中, N_eff 越小。反映「實質有多少檔在影響組合」。</dd>
-
-<dt>產業報酬 (Industry / Factor Return) — 本期 {fmt_pct(perf['industry_active'])}</dt>
-<dd>
-<strong>定義</strong>: 「<em>產業配置決策</em>」對 Active Return 的貢獻 — 也就是「超配/低配某產業」相對基準產生的報酬。對應 Brinson-Fachler 公式的 <strong>Allocation Effect</strong>。<br><br>
-<strong>公式</strong>:<br>
-<code>產業報酬 = Σ<sub>sector i</sub> (wP<sub>i</sub> − wB<sub>i</sub>) × (rB<sub>i</sub> − rB<sub>total</sub>)</code><br>
-<ul>
-  <li>wP<sub>i</sub> = 組合在 sector i 的權重</li>
-  <li>wB<sub>i</sub> = 基準 (SPY) 在 sector i 的權重</li>
-  <li>rB<sub>i</sub> = 基準在 sector i 的報酬率</li>
-  <li>rB<sub>total</sub> = 基準整體報酬率</li>
-</ul>
-<strong>直覺</strong>: 「<em>超配 (wP&gt;wB) 一個跑贏大盤 (rB&gt;rB_total) 的產業</em>」會貢獻正值;「<em>超配跑輸大盤的產業</em>」或「<em>低配跑贏大盤的產業</em>」會貢獻負值。<br><br>
-<strong>例</strong>: 若 SPY 整體 +11%, 而 IT sector +24%, 我們把 IT 從 SPY 的 34% 加碼到 63% (active +29%), 則 IT 的產業報酬貢獻 ≈ 29% × (24% − 11%) = <strong>+3.8 pp</strong>。<br><br>
-<strong>本期 +40.99%</strong>: 大幅超配 IT (active +28.6%) 且 IT 在 SPY 內漲幅遠高於整體, 加上低配跑輸大盤的金融/非核心消費等, 共同貢獻顯著的產業配置 alpha — 是本期 Active Return 的主力來源。
-</dd>
-
-<dt>個股選擇報酬 (Selection Return) — 本期 {fmt_pct(perf['selection_active'])}</dt>
-<dd>
-<strong>定義</strong>: 「<em>個股選擇能力</em>」對 Active Return 的貢獻 — 在每個產業內, 我們挑的股票是否跑贏該產業平均。對應 Brinson 公式的 <strong>Selection Effect</strong>。<br><br>
-<strong>公式</strong>:<br>
-<code>個股選擇報酬 = Σ<sub>sector i</sub> wB<sub>i</sub> × (rP<sub>i</sub> − rB<sub>i</sub>)</code><br>
-<ul>
-  <li>rP<sub>i</sub> = 組合在 sector i 內持有股票的加權平均報酬</li>
-  <li>rB<sub>i</sub> = 基準在 sector i 內所有成分股的加權平均報酬</li>
-</ul>
-<strong>直覺</strong>: 跟產業權重決策無關, 只看「在每個產業內, 我們挑的個股是否比該產業的『平均水準』表現更好」。即使你完全照基準的產業權重配置, 只要選股精準, 仍能產生正的個股選擇報酬。<br><br>
-<strong>例</strong>: SPY 內 IT sector 平均 +24%, 但我們持有的 IT 股票 (SNDK / MU / WDC...) 加權平均 +78%, 則 IT 內選股超額 = +54 pp。乘以基準 IT 權重 34% ≈ <strong>+18 pp</strong> 個股選擇貢獻。<br><br>
-<strong>本期 -2.52%</strong>: 整體選股略負主因:
-工業 sector 內持股表現 (rP 約 +39%) 雖優於 SPY 工業 (+12%), 但金融內的持股表現拖累 (rP 約 -10% vs SPY 金融 -5%); 非核心消費內持股也跑輸 sector 平均。<br>
-注意: 雖然 Selection 數字略負, 但這跟 Tab 11 看到的「在倉持股 SPY 百分位 63」、「Top 10 漲幅命中 5/10」並不矛盾 — 後者是<em>等權</em>角度看選股, 前者是<em>加權 + 跨產業</em>角度看的 alpha 拆解。
-</dd>
-
-<dt>兩者組合 = Active Return</dt>
-<dd>
-<code>Active Return = 產業報酬 + 個股選擇報酬</code> (本報告已剔除 Timing)<br>
-本期: <strong>{fmt_pct(perf['active_return'])}</strong> ≈
-{fmt_pct(perf['industry_active'])} (產業) + {fmt_pct(perf['selection_active'])} (個股)<br><br>
-<strong>解讀</strong>:
-本期模型 Active 主要靠「<strong>產業配置</strong>」(對的 sector 重押 IT 並避開虧錢的 Health Care / Energy 等),
-個股選擇略為拖累但無傷大局。
-若選股能力 (Selection) 與產業配置 (Industry) 都能同步為正, 將是最理想的 alpha 結構;
-目前模型偏 top-down (產業主導) 風格。
-</dd>
 </dl>
 """
 
@@ -1332,6 +1384,16 @@ table.data-table th {
 table.data-table td { padding: 7px 8px; border-bottom: 1px solid #ECF0F1; }
 table.data-table tr:hover { background: #F8F9FA; }
 table.data-table td:nth-child(n+3) { text-align: right; font-variant-numeric: tabular-nums; }
+table.data-table td:nth-child(2) { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Expandable attribution table */
+table.expandable-table tr.sector-row { cursor: pointer; background: #F4F8FB; }
+table.expandable-table tr.sector-row:hover { background: #E3EEF7; }
+table.expandable-table tr.sector-row.expanded { background: #DCE9F4; }
+table.expandable-table tr.sec-detail { background: #FAFBFC; font-size: 12px; color: #5D6D7E; }
+table.expandable-table tr.sec-detail td { border-bottom: 1px dashed #ECF0F1; }
+table.expandable-table .toggle { display: inline-block; width: 14px; transition: transform 0.15s ease; color: #1F4E79; font-size: 11px; }
+table.expandable-table tr.sector-row.expanded .toggle { transform: rotate(90deg); }
 
 details { background: #F8F9FA; padding: 10px 14px; border-radius: 6px; margin-top: 8px; }
 details summary { cursor: pointer; font-weight: 600; color: #1F4E79; }
@@ -1361,6 +1423,20 @@ document.addEventListener('DOMContentLoaded', function() {
           });
         }
       }, 50);
+    });
+  });
+
+  // Expandable attribution table: sector row toggles its security rows
+  // 範圍限制在同一個 table 內, 避免多張表互相觸發
+  document.querySelectorAll('table.expandable-table tr.sector-row').forEach(function(row) {
+    row.addEventListener('click', function() {
+      var sector = this.getAttribute('data-sector');
+      var expanded = this.classList.toggle('expanded');
+      var table = this.closest('table');
+      var sel = 'tr.sec-detail[data-parent="' + sector + '"]';
+      table.querySelectorAll(sel).forEach(function(r) {
+        r.style.display = expanded ? '' : 'none';
+      });
     });
   });
 });

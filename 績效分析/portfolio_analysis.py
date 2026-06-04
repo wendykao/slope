@@ -631,7 +631,12 @@ def main():
     OUTPUT_HTML.write_text(html, encoding='utf-8')
     print(f'  ✓ HTML 報告已產出: {OUTPUT_HTML.name}  ({OUTPUT_HTML.stat().st_size/1024:.1f} KB)')
     print(f'  路徑: {OUTPUT_HTML}')
-    print('=' * 78 + '\n')
+    print('=' * 78)
+
+    # 自動開啟瀏覽器
+    import webbrowser
+    webbrowser.open(OUTPUT_HTML.as_uri())
+    print(f'  → 已在預設瀏覽器開啟報表\n')
 
 
 if __name__ == '__main__':
