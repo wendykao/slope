@@ -20,10 +20,20 @@ pd.set_option('display.float_format', lambda x: f'{x:,.4f}' if abs(x) < 1 else f
 pd.set_option('display.width', 200)
 pd.set_option('display.max_columns', None)
 
-FP = Path(__file__).parent / '計量績效分析.xlsx'
+_ROOT = Path(__file__).parent
+FP_HOLDINGS = _ROOT / '計量持股.xlsx'             # 持股 + 交易 (2 sheets)
+FP_BB = _ROOT / 'Bloomberg歸因分析.xlsx'           # 每個 sheet 為一個期間的歸因
+# 向後相容: 沿用舊變數名給其他地方引用
+FP = FP_HOLDINGS
 
-# 簡單法分母: 固定 USD 665M (核給額度)
-SIMPLE_RETURN_DENOMINATOR = 665_000_000
+# ====================================================================
+# 可調整參數 (修改這兩個變數即可改變整份報告的口徑與截止日)
+# ====================================================================
+QUOTA_USD = 665_000_000                          # 額度 (USD), 簡單法分母
+REVIEW_DATE = pd.Timestamp('2026-05-21')         # 績效檢視日期 — 所有分析截止於此日
+
+# 向後相容: 沿用舊變數名
+SIMPLE_RETURN_DENOMINATOR = QUOTA_USD
 
 # 11 個 GICS sectors (Bloomberg 中文)
 SECTORS_GICS = ['通訊服務', '非核心消費', '核心消費', '能源', '金融',
@@ -233,21 +243,93 @@ def _get_bb_column_map(bb_raw):
 # =============================================================
 # 1. Data loader
 # =============================================================
-def load_data(fp):
+def _pick_bb_sheet(fp_bb, target_date):
+    """挑選與 target_date 最接近 (>=) 的 Bloomberg sheet (sheet 名格式 YYYYMMDD)"""
+    xl = pd.ExcelFile(fp_bb)
+    sheets = []
+    for name in xl.sheet_names:
+        try:
+            sheets.append((pd.Timestamp(str(name)), name))
+        except Exception:
+            pass
+    if not sheets:
+        raise ValueError(f'{fp_bb.name}: 無法解析任何 sheet 名為日期')
+    sheets.sort()
+    target = pd.Timestamp(target_date)
+    # 完全相等優先
+    for d, name in sheets:
+        if d == target:
+            return name
+    # 否則挑最接近 target 的
+    nearest = min(sheets, key=lambda x: abs((x[0] - target).days))
+    print(f'  [Bloomberg] period_end={target.date()} 無對應 sheet, 改用最近 {nearest[1]} ({nearest[0].date()})')
+    return nearest[1]
+
+
+def load_data(fp=None, *, fp_holdings=None, fp_bb=None, bb_sheet=None):
+    """
+    參數:
+        fp_holdings: 計量持股.xlsx (含 持股 + 交易 兩 sheet)
+        fp_bb: Bloomberg歸因分析.xlsx (多個期間 sheet, sheet 名格式 YYYYMMDD)
+        bb_sheet: 指定 Bloomberg sheet 名; None 表示自動挑選與 period_end 對應的
+        fp: 向後相容; 若給單一檔案, 兩種資料都從同一檔讀 (舊版單檔模式)
+    """
+    if fp_holdings is None:
+        fp_holdings = fp if fp else FP_HOLDINGS
+    if fp_bb is None:
+        fp_bb = FP_BB if FP_BB.exists() else fp_holdings
+
     # ---- 持股 (daily snapshots) ----
-    holdings = pd.read_excel(fp, sheet_name='持股')
+    # 持股 sheet 有兩套 P&L/COST 欄位:
+    #   TOTAL_*       : since-inception (持有以來累積)
+    #   Reset_TOTAL_* : YTD reset (每年 1/1 歸零, 反映本年度損益)
+    # 本報表所有期間分析都以 Reset 版本為準 → 直接覆寫 TOTAL_* 為 Reset_*.
+    # 原始 since-inception 欄位保留為 _inception_TOTAL_*, 供需要時引用.
+    holdings = pd.read_excel(fp_holdings, sheet_name='持股')
     holdings['DATE_'] = holdings['DATE_'].apply(parse_date_int)
     holdings['ticker'] = holdings['BBG_TICKER'].apply(norm_ticker)
-    for c in ['TOTAL_SHARES', 'TOTAL_COST', 'AVG_UNIT_COST', 'CLS_PRICE',
-              'TOTAL_MV', 'TOTAL_URCG', 'TOTAL_DVD', 'TOTAL_REALIZED', 'TOTAL_PL']:
-        holdings[c] = pd.to_numeric(holdings[c], errors='coerce')
+    # 修正持股 sheet STK_NAME 佔位字
+    STK_NAME_OVERRIDE = {
+        'COHR US': '連貫公司',
+    }
+    holdings['STK_NAME'] = holdings.apply(
+        lambda r: STK_NAME_OVERRIDE.get(r['BBG_TICKER'], r['STK_NAME']), axis=1
+    )
+    numeric_cols = ['TOTAL_SHARES', 'TOTAL_COST', 'AVG_UNIT_COST', 'CLS_PRICE',
+                    'TOTAL_MV', 'TOTAL_URCG', 'TOTAL_DVD', 'TOTAL_REALIZED', 'TOTAL_PL',
+                    'Reset_TOTAL_COST', 'Reset_AVG_UNIT_COST',
+                    'Reset_TOTAL_URCG', 'Reset_TOTAL_REALIZED', 'Reset_TOTAL_PL']
+    for c in numeric_cols:
+        if c in holdings.columns:
+            holdings[c] = pd.to_numeric(holdings[c], errors='coerce')
+
+    # 用 Reset (YTD) 欄位覆寫 since-inception 欄位; 原欄位備份到 _inception_*
+    RESET_MAP = {
+        'Reset_TOTAL_COST': 'TOTAL_COST',
+        'Reset_AVG_UNIT_COST': 'AVG_UNIT_COST',
+        'Reset_TOTAL_URCG': 'TOTAL_URCG',
+        'Reset_TOTAL_REALIZED': 'TOTAL_REALIZED',
+        'Reset_TOTAL_PL': 'TOTAL_PL',
+    }
+    for reset_col, base_col in RESET_MAP.items():
+        if reset_col in holdings.columns:
+            holdings[f'_inception_{base_col}'] = holdings[base_col]
+            holdings[base_col] = holdings[reset_col]
+    # TOTAL_DVD 無 Reset 變種; Reset_PL 公式驗證: Reset_PL = Reset_URCG + Reset_REALIZED + TOTAL_DVD,
+    # 表示 TOTAL_DVD 已隱含 YTD 口徑 (該年股息收入), 不需另外處理
+
+    # 按 REVIEW_DATE 截斷; 取 <= REVIEW_DATE 的最大日期當期末
+    holdings = holdings[holdings['DATE_'] <= REVIEW_DATE].copy()
+    if holdings.empty:
+        raise ValueError(f'持股資料中沒有 <= REVIEW_DATE ({REVIEW_DATE.date()}) 的快照')
 
     dates = sorted(holdings['DATE_'].unique())
     period_start = dates[0]
     period_end = dates[-1]
+    print(f'  [REVIEW_DATE] 截至 {REVIEW_DATE.date()}; 實際 period_end = {period_end.date()} ({len(dates)} 個交易日)')
 
     # ---- 交易 ----
-    tr = pd.read_excel(fp, sheet_name='交易')
+    tr = pd.read_excel(fp_holdings, sheet_name='交易')
     tr['交易日期'] = pd.to_datetime(tr['交易日期'])
     tr['ticker'] = tr['股票代碼(代碼)'].apply(norm_ticker)
     tr = tr.rename(columns={
@@ -269,9 +351,19 @@ def load_data(fp):
             tr[c] = pd.to_numeric(tr[c], errors='coerce')
     tr['signed_qty'] = np.where(tr['side'] == '買', tr['qty'], -tr['qty'])
     tr['signed_amount'] = np.where(tr['side'] == '買', tr['amount'], -tr['amount'])
+    # 同樣按 REVIEW_DATE 截斷
+    tr = tr[tr['交易日期'] <= REVIEW_DATE].copy()
 
     # ---- Bloomberg 歸因分析 ----
-    bb_raw = pd.read_excel(fp, sheet_name='Bloomberg歸因分析', header=None)
+    bb_sheet_names = pd.ExcelFile(fp_bb).sheet_names
+    if 'Bloomberg歸因分析' in bb_sheet_names:
+        # 舊版單 sheet 模式
+        bb_raw = pd.read_excel(fp_bb, sheet_name='Bloomberg歸因分析', header=None)
+    else:
+        # 新版: 每 sheet 為一個期間 (sheet 名 YYYYMMDD)
+        sheet_to_use = bb_sheet or _pick_bb_sheet(fp_bb, period_end)
+        print(f'  [Bloomberg] 使用 sheet: {sheet_to_use} (對應 period_end {period_end.date()})')
+        bb_raw = pd.read_excel(fp_bb, sheet_name=sheet_to_use, header=None)
     # 以雙層表頭自動對應欄位，避免欄位新增/重排後固定 slice 失準
     bb_data_row, bb_col_map = _get_bb_column_map(bb_raw)
     bb_cols = [col for col in BB_COLUMN_ORDER if col in bb_col_map]
@@ -331,9 +423,15 @@ def load_data(fp):
     md_denom = mv_start + weighted_cf
     md_return = (mv_end - mv_start - net_cf) / md_denom if md_denom else None
 
-    # Active Share = ½ × Σ |w_port - w_bench| (from Bloomberg security-level data)
+    # Active Share = ½ × Σ |w_port - w_bench|
+    # 業界慣例使用「期末快照」權重 (point-in-time end-of-period), 反映報告日結構差異
+    # 期間平均 (wt_active) 因為前期 cash heavy → 權重被攤平, 不適合作為結構差異指標
     bb_secs_all = bb[~bb['is_sector'] & ~bb['name'].isin(['Holdings', 'Residuals', 'QUANT'])]
-    active_share = bb_secs_all['wt_active'].abs().sum() / 2 / 100  # Bloomberg 值為 % 形式
+    if 'end_wt_active' in bb_secs_all.columns and bb_secs_all['end_wt_active'].notna().any():
+        active_share = bb_secs_all['end_wt_active'].abs().sum() / 2 / 100        # 期末 (主要顯示)
+    else:
+        active_share = bb_secs_all['wt_active'].abs().sum() / 2 / 100
+    active_share_avg = bb_secs_all['wt_active'].abs().sum() / 2 / 100             # 期間平均 (reference)
 
     totals = {
         'period_start': period_start,
@@ -350,7 +448,8 @@ def load_data(fp):
         'dvd_end': h_end['TOTAL_DVD'].sum(),
         'net_cf': net_cf,
         'md_return': md_return,
-        'active_share': active_share,
+        'active_share': active_share,           # 期末口徑 (主要)
+        'active_share_avg': active_share_avg,   # 期間平均 (reference)
         # Bloomberg authoritative numbers
         'bb_port_return': bb_holdings['tr_port'] / 100 if bb_holdings is not None else None,
         'bb_bench_return': bb_holdings['tr_bench'] / 100 if bb_holdings is not None else None,
@@ -397,7 +496,8 @@ def section_performance(d):
     print(f"  [D] SPY (基準)               : {pct(t['bb_bench_return'])}")
     print()
     print(f"  Active Return (C - D)        : {pct(t['bb_active_return'])}")
-    print(f"  Active Share                 : {pct(t['active_share'], 2)}    (½ × Σ|wP-wB|, Bloomberg sec-level)")
+    print(f"  Active Share (期末口徑)      : {pct(t['active_share'], 2)}    (½ × Σ|w_P − w_B|, end-of-period)")
+    print(f"  Active Share (期間平均, ref) : {pct(t.get('active_share_avg'), 2)}")
     print()
     print("  [說明] Bloomberg TWRR (C) 為每日真實時間加權, 與 SPY 同基準的標準口徑")
     print("         Modified Dietz (B) 是自算近似法, 應接近 (C)")
@@ -416,6 +516,7 @@ def section_performance(d):
         'spy_return': t['bb_bench_return'],
         'active_return': t['bb_active_return'],
         'active_share': t['active_share'],
+        'active_share_avg': t.get('active_share_avg'),
         'industry_active': t['bb_industry_active'],
         'selection_active': t['bb_selection_active'],
     }
@@ -444,9 +545,9 @@ def section_holdings(d):
                                               'TOTAL_REALIZED', 'TOTAL_DVD', 'TOTAL_PL']].copy()
     print(bot10.to_string(index=False))
 
-    # ---- P&L 結構 ----
-    sub('P&L 結構分解')
-    total_urcg = h_end['TOTAL_URCG'].sum()
+    # ---- P&L 結構 (YTD from Reset_*) ----
+    sub('P&L 結構分解 (YTD, Reset_* 欄位)')
+    total_urcg = h_end['TOTAL_URCG'].sum()       # 已是 Reset_TOTAL_URCG (load_data 覆寫)
     total_realized = h_end['TOTAL_REALIZED'].sum()
     total_dvd = h_end['TOTAL_DVD'].sum()
     total_pnl = h_end['TOTAL_PL'].sum()
@@ -480,9 +581,16 @@ def section_holdings(d):
     print(f"  Top 10 權重: {pct(top10_w)}")
     print(f"  有效持股數 (1/Σw²): {eff_n:.1f}")
 
+    # 全部曾持有 ticker 之 YTD P&L (h_end['TOTAL_PL'] 已是 Reset_TOTAL_PL = YTD)
+    all_contributors = h_end[h_end['TOTAL_PL'].notna() & (h_end['TOTAL_PL'].abs() > 1.0)][
+        ['ticker', 'STK_NAME', 'TOTAL_URCG', 'TOTAL_REALIZED', 'TOTAL_DVD', 'TOTAL_PL']
+    ].copy().sort_values('TOTAL_PL', ascending=False).reset_index(drop=True)
+
     return {
         'held': held, 'held_sorted': held_sorted,
         'top10': top10, 'bot10': bot10,
+        'all_contributors': all_contributors,
+        'quota_usd': QUOTA_USD,
         'pnl_decomp': {'urcg': total_urcg, 'rcg': total_realized,
                        'dvd': total_dvd, 'total': total_pnl},
         'n_continued': len(continued), 'n_new': len(new_pos), 'n_sold_out': len(sold_out),
@@ -516,6 +624,12 @@ def section_daily(d):
 def section_sector(d):
     hr('4. 產業 (GICS) 曝險與報酬 (Bloomberg)')
     bb = d['bb_sectors'].copy()
+    # 期末權重: 覆寫 wt_* → end_wt_* (本期報表口徑統一用期末快照)
+    end_map = {'end_wt_port': 'wt_port', 'end_wt_bench': 'wt_bench', 'end_wt_active': 'wt_active'}
+    for src, dst in end_map.items():
+        if src in bb.columns and bb[src].notna().any():
+            bb[f'_avg_{dst}'] = bb[dst]   # 備份期間平均
+            bb[dst] = bb[src]
     bb = bb.fillna({'wt_port': 0, 'tr_port': 0})
     bb = bb.sort_values('wt_active', ascending=False).reset_index(drop=True)
     # 顯示用子集
@@ -526,37 +640,517 @@ def section_sector(d):
         out[c] = out[c].apply(lambda x: f'{x:+7.2f}' if pd.notna(x) and x != 0 else '   0.00')
     print(out.to_string(index=False))
     print()
-    print("  [註] wP/wB = 平均權重 (Bloomberg 期間平均, 非單日 snapshot)")
+    print("  [註] wP/wB = 期末權重 (end_wt_*, Bloomberg 報告日 snapshot)")
     print("        rP/rB = 期間總報酬, rActive = rP - rB")
-    return bb  # 回傳完整 bb (含 industry/sel/ctr 等欄, 時間報酬已於載入時移除), 給 HTML 使用
+    return bb  # 回傳完整 bb (期末權重覆寫已套用), 給 HTML 使用
 
 
 # =============================================================
-# 6. 歸因分析 (Bloomberg)
+# 6. Brinson 歸因 (自算; 多期 + Carino linking)
 # =============================================================
-def section_attribution(d):
-    hr('5. Bloomberg 歸因分析 (Active 拆解: 產業報酬 + 個股選擇報酬)')
-    t = d['totals']
+def _load_bb_snapshot(fp_bb, sheet_name):
+    """讀單一 Bloomberg sheet, 取出 Holdings 列 + 各 sector 列"""
+    bb_raw = pd.read_excel(fp_bb, sheet_name=sheet_name, header=None)
+    bb_data_row, bb_col_map = _get_bb_column_map(bb_raw)
+    bb_cols = [c for c in BB_COLUMN_ORDER if c in bb_col_map]
+    bb = bb_raw.iloc[bb_data_row:, [bb_col_map[c] for c in bb_cols]].copy()
+    bb.columns = bb_cols
+    bb = bb.dropna(subset=['name']).reset_index(drop=True)
+    for c in bb.columns:
+        if c not in {'name', 'code'}:
+            bb[c] = pd.to_numeric(bb[c], errors='coerce')
+    holdings_row = bb[bb['name'] == 'Holdings']
+    holdings = holdings_row.iloc[0] if len(holdings_row) else None
+    sectors = bb[bb['name'].isin(SECTORS_GICS)].copy()
+    return holdings, sectors
+
+
+def _load_all_bb_snapshots(fp_bb):
+    """讀 Bloomberg歸因分析.xlsx 全部 sheet, sheet 名為日期 → 各 sheet 為 cumulative attribution"""
+    xl = pd.ExcelFile(fp_bb)
+    snapshots = []
+    for name in xl.sheet_names:
+        try:
+            date = pd.Timestamp(str(name))
+        except Exception:
+            continue
+        h, secs = _load_bb_snapshot(fp_bb, name)
+        if h is None:
+            continue
+        snapshots.append({'date': date, 'sheet': name, 'holdings': h, 'sectors': secs})
+    snapshots.sort(key=lambda x: x['date'])
+    return snapshots
+
+
+def _compute_subperiod_port(holdings_daily, trades, d_start, d_end, ticker_to_sector):
+    """
+    子期間 sector w_p / r_p — 用每日 TWRR + 時間加權權重
+
+      w_p,i = avg(MV_sector_t / MV_total_t) over days   # 時間加權平均權重
+      r_p,i = ∏(1 + daily_sector_return_t) - 1
+        其中 daily_sector_return_t = (MV_sector_t - MV_sector_{t-1} - sector_CF_t) / MV_sector_{t-1}
+        sector_CF_t = 該日 sector 內所有 ticker 的 net 買進金額 (買 = +, 賣 = -)
+    """
+    mask = (holdings_daily['DATE_'] >= d_start) & (holdings_daily['DATE_'] <= d_end)
+    h_sub = holdings_daily[mask].copy()
+    if h_sub.empty or h_sub['DATE_'].nunique() < 2:
+        return None
+    h_sub['sector'] = h_sub['ticker'].map(ticker_to_sector).fillna('其他')
+
+    # 每日 sector MV 矩陣 (DATE_ × sector)
+    sector_mv = h_sub.pivot_table(index='DATE_', columns='sector', values='TOTAL_MV',
+                                   aggfunc='sum', fill_value=0).sort_index()
+
+    # 每日 sector CF (signed_amount: 買 > 0, 賣 < 0)
+    tr_mask = (trades['交易日期'] >= d_start) & (trades['交易日期'] <= d_end)
+    tr_sub = trades[tr_mask].copy()
+    if len(tr_sub):
+        tr_sub['sector'] = tr_sub['ticker'].map(ticker_to_sector).fillna('其他')
+        sector_cf = tr_sub.pivot_table(index='交易日期', columns='sector', values='signed_amount',
+                                        aggfunc='sum', fill_value=0)
+        # align dates to sector_mv index, columns to all sectors
+        sector_cf = sector_cf.reindex(sector_mv.index, fill_value=0)
+        for c in sector_mv.columns:
+            if c not in sector_cf.columns:
+                sector_cf[c] = 0
+        sector_cf = sector_cf[sector_mv.columns]
+    else:
+        sector_cf = pd.DataFrame(0, index=sector_mv.index, columns=sector_mv.columns)
+
+    # 每日 sector return: r_t = (MV_t - MV_{t-1} - CF_t) / MV_{t-1}
+    mv_prev = sector_mv.shift(1)
+    cf_today = sector_cf
+    # 計算 daily returns; 防呆: 當 MV_{t-1} <= 0 時, daily return = 0 (新部位開始, 視為 day-1 無報酬)
+    daily_r = (sector_mv - mv_prev - cf_today) / mv_prev.where(mv_prev > 0)
+    daily_r = daily_r.fillna(0)
+    # 第一天 NaN → 0 (沒有前一日)
+    daily_r.iloc[0] = 0
+
+    # 各 sector TWRR: ∏(1 + r_t) - 1
+    twrr = (1 + daily_r).prod(axis=0) - 1
+
+    # 時間加權平均權重 w_p,i (用 sub-period 每日權重平均)
+    total_mv_daily = sector_mv.sum(axis=1)
+    sector_w_daily = sector_mv.div(total_mv_daily.replace(0, np.nan), axis=0).fillna(0)
+    avg_weight = sector_w_daily.mean()  # average over days
+
+    # 組成輸出
+    rows = []
+    for sec in sector_mv.columns:
+        rows.append({
+            'sector': sec,
+            'w_p': float(avg_weight.get(sec, 0)),
+            'r_p': float(twrr.get(sec, 0)),
+            'avg_mv': float(sector_mv[sec].mean()),
+            'capital': float(sector_mv[sec].max()),
+            'delta_pl': float((sector_mv[sec].iloc[-1] - sector_mv[sec].iloc[0]) - sector_cf[sec].sum()),
+        })
+    return pd.DataFrame(rows)
+
+
+def compute_brinson_multiperiod(d, fp_bb):
+    """
+    多期 Brinson + Carino linking. 子期間定義為相鄰 Bloomberg snapshot 之間.
+
+      每子期間 Brinson:
+        Allocation_i(t) = (w_P,i(t) - w_B,i(t)) × (r_B,i(t) - r_B_total(t))
+        Selection_i(t)  = w_P,i(t) × (r_P,i(t) - r_B,i(t))
+
+      Carino linking:
+        R_p = ∏(1 + r_P_implied,t) - 1
+        R_b = ∏(1 + r_B_total,t) - 1
+        R_active = R_p - R_b
+        k = ln(1+R_p)/R_p − ln(1+R_b)/R_b 之比 (或更精確: ln(R_active+1)/R_active)
+        k_t = (ln(1+r_p,t) - ln(1+r_b,t)) / (r_p,t - r_b,t)
+        Total_alloc = Σ (k_t / k) × alloc_total(t)
+    """
+    snapshots = _load_all_bb_snapshots(fp_bb)
+    # 按 REVIEW_DATE 截斷
+    snapshots = [s for s in snapshots if s['date'] <= REVIEW_DATE]
+    if len(snapshots) < 2:
+        # 只有 1 個 snapshot, 退回單期計算
+        return None, None
+
+    # ticker → sector 從最後一個 snapshot 取
+    last_snap = snapshots[-1]
+    bb_secs_last = pd.read_excel(fp_bb, sheet_name=last_snap['sheet'], header=None)
+    bb_data_row, bb_col_map = _get_bb_column_map(bb_secs_last)
+    bb_cols = [c for c in BB_COLUMN_ORDER if c in bb_col_map]
+    bb_full = bb_secs_last.iloc[bb_data_row:, [bb_col_map[c] for c in bb_cols]].copy()
+    bb_full.columns = bb_cols
+    bb_full = bb_full.dropna(subset=['name']).reset_index(drop=True)
+    bb_full['is_sector'] = bb_full['name'].isin(SECTORS_GICS)
+    bb_full['sector'] = np.where(bb_full['is_sector'], bb_full['name'], np.nan)
+    bb_full['sector'] = bb_full['sector'].ffill()
+    sec_universe = bb_full[~bb_full['is_sector'] & ~bb_full['name'].isin(['Holdings', 'Residuals', 'QUANT'])]
+    sec_universe = sec_universe[sec_universe['sector'].notna()]
+    if 'code' in sec_universe.columns:
+        sec_universe = sec_universe.copy()
+        sec_universe['_code'] = sec_universe['code'].apply(norm_ticker)
+        for c in [col for col in sec_universe.columns if col not in {'name', 'code', 'sector', '_code', 'is_sector'}]:
+            sec_universe[c] = pd.to_numeric(sec_universe[c], errors='coerce')
+        sec_sorted = sec_universe[sec_universe['_code'].notna()].sort_values('wt_port', ascending=False, na_position='last')
+        ticker_to_sector = {}
+        for _, r in sec_sorted.iterrows():
+            c = r['_code']
+            if c and c not in ticker_to_sector:
+                ticker_to_sector[c] = r['sector']
+    else:
+        ticker_to_sector = {}
+
+    # 將 cumulative snapshot 轉成子期間 (cumulative → period return via ratio)
+    sub_periods = []
+    for i, snap in enumerate(snapshots):
+        # 累積至 snap['date'] 的 Bloomberg holdings
+        h_cum = snap['holdings']
+        secs_cum = snap['sectors'].copy()
+        # cum_r_b_total
+        cum_r_b_total = float(h_cum['tr_bench']) / 100 if 'tr_bench' in h_cum.index else 0
+        cum_sectors = {}
+        for _, row in secs_cum.iterrows():
+            cum_sectors[row['name']] = {
+                'w_b': float(row['wt_bench']) / 100 if pd.notna(row['wt_bench']) else 0,
+                'r_b': float(row['tr_bench']) / 100 if pd.notna(row['tr_bench']) else 0,
+            }
+        snap['_cum_r_b_total'] = cum_r_b_total
+        snap['_cum_sectors'] = cum_sectors
+
+    # 期初 = 持股最早日期 (2025-12-31) 或 1/1
+    period_start = d['totals']['period_start']
+    prev_date = period_start
+    prev_cum_r_b_total = 0
+    prev_cum_sectors = {sec: {'w_b': 0, 'r_b': 0} for sec in SECTORS_GICS}
+
+    for snap in snapshots:
+        # 子期間
+        r_b_total = (1 + snap['_cum_r_b_total']) / (1 + prev_cum_r_b_total) - 1 if (1 + prev_cum_r_b_total) > 0 else snap['_cum_r_b_total']
+        sectors_sub = {}
+        for sec, cum in snap['_cum_sectors'].items():
+            prev = prev_cum_sectors.get(sec, {'w_b': 0, 'r_b': 0})
+            sub_r_b = (1 + cum['r_b']) / (1 + prev['r_b']) - 1 if (1 + prev['r_b']) > 0 else cum['r_b']
+            # 用「期末權重」當該子期間的 w_b (簡化, 真正應用期間平均)
+            sectors_sub[sec] = {'w_b': cum['w_b'], 'r_b': sub_r_b}
+        # 組合側
+        port_sec = _compute_subperiod_port(d['holdings'], d['trades'], prev_date, snap['date'], ticker_to_sector)
+        if port_sec is None:
+            prev_date = snap['date']
+            prev_cum_r_b_total = snap['_cum_r_b_total']
+            prev_cum_sectors = snap['_cum_sectors']
+            continue
+        sub_periods.append({
+            'date_start': prev_date,
+            'date_end': snap['date'],
+            'r_b_total': r_b_total,
+            'sectors_bench': sectors_sub,
+            'port_sec': port_sec,
+        })
+        prev_date = snap['date']
+        prev_cum_r_b_total = snap['_cum_r_b_total']
+        prev_cum_sectors = snap['_cum_sectors']
+
+    # 計算每子期間的 Brinson — 3 components 分開: Allocation / Selection_classic / Interaction
+    all_sectors = set()
+    for sp in sub_periods:
+        all_sectors.update(sp['sectors_bench'].keys())
+        all_sectors.update(sp['port_sec']['sector'].tolist())
+    all_sectors = sorted(all_sectors)
+
+    sub_alloc_total_list = []
+    sub_select_total_list = []
+    sub_interact_total_list = []
+    sub_r_p_implied_list = []
+    sub_r_b_total_list = []
+    sector_effects_raw = {sec: {'allocation': 0, 'selection': 0, 'interaction': 0} for sec in all_sectors}
+
+    for sp in sub_periods:
+        port_dict = sp['port_sec'].set_index('sector').to_dict('index')
+        alloc_t = 0
+        select_t = 0
+        interact_t = 0
+        r_p_implied_t = 0
+        for sec in all_sectors:
+            w_p = port_dict.get(sec, {}).get('w_p', 0)
+            r_p = port_dict.get(sec, {}).get('r_p', 0)
+            if pd.isna(r_p):
+                r_p = 0
+            w_b = sp['sectors_bench'].get(sec, {}).get('w_b', 0)
+            r_b = sp['sectors_bench'].get(sec, {}).get('r_b', 0)
+            alloc = (w_p - w_b) * (r_b - sp['r_b_total'])
+            select = w_b * (r_p - r_b)        # classic Selection (用 wB)
+            interact = (w_p - w_b) * (r_p - r_b)
+            sector_effects_raw[sec]['allocation'] += alloc
+            sector_effects_raw[sec]['selection'] += select
+            sector_effects_raw[sec]['interaction'] += interact
+            alloc_t += alloc
+            select_t += select
+            interact_t += interact
+            r_p_implied_t += w_p * r_p
+        sub_alloc_total_list.append(alloc_t)
+        sub_select_total_list.append(select_t)
+        sub_interact_total_list.append(interact_t)
+        sub_r_p_implied_list.append(r_p_implied_t)
+        sub_r_b_total_list.append(sp['r_b_total'])
+
+    # Geometric (compound) totals
+    R_p = np.prod([1 + r for r in sub_r_p_implied_list]) - 1
+    R_b = np.prod([1 + r for r in sub_r_b_total_list]) - 1
+    R_active = R_p - R_b
+
+    # Carino smoothing
+    def safe_log_ratio(r):
+        return np.log(1 + r) if (1 + r) > 0 else 0
+
+    if abs(R_active) > 1e-12 and (1 + R_p) > 0 and (1 + R_b) > 0:
+        k = (safe_log_ratio(R_p) - safe_log_ratio(R_b)) / R_active
+    else:
+        k = 1.0
+
+    # 各子期間 smoothing factor
+    smoothing = []
+    for r_p, r_b in zip(sub_r_p_implied_list, sub_r_b_total_list):
+        r_a = r_p - r_b
+        if abs(r_a) < 1e-12 or (1 + r_p) <= 0 or (1 + r_b) <= 0:
+            smoothing.append(1.0)
+        else:
+            k_t = (safe_log_ratio(r_p) - safe_log_ratio(r_b)) / r_a
+            smoothing.append(k_t / k if k != 0 else 1.0)
+
+    # 套 smoothing (3 self-computed components) — Carino 保證 Σ = R_p − R_b (self)
+    total_alloc = sum(a * s for a, s in zip(sub_alloc_total_list, smoothing))
+    total_select = sum(s * sm for s, sm in zip(sub_select_total_list, smoothing))
+    total_interact = sum(i * sm for i, sm in zip(sub_interact_total_list, smoothing))
+
+    # 殘差 = 自算 Active − Σ 3 項 (Carino 後應接近 0, 僅浮點誤差)
+    residual = R_active - (total_alloc + total_select + total_interact)
+
+    # Per-sector 套 smoothing (用每子期間的 smoothing factor)
+    sector_effects_smoothed = {sec: {'allocation': 0, 'selection': 0, 'interaction': 0}
+                               for sec in all_sectors}
+    for i, sp in enumerate(sub_periods):
+        port_dict = sp['port_sec'].set_index('sector').to_dict('index')
+        sm = smoothing[i]
+        for sec in all_sectors:
+            w_p = port_dict.get(sec, {}).get('w_p', 0)
+            r_p = port_dict.get(sec, {}).get('r_p', 0)
+            if pd.isna(r_p):
+                r_p = 0
+            w_b = sp['sectors_bench'].get(sec, {}).get('w_b', 0)
+            r_b = sp['sectors_bench'].get(sec, {}).get('r_b', 0)
+            sector_effects_smoothed[sec]['allocation'] += (w_p - w_b) * (r_b - sp['r_b_total']) * sm
+            sector_effects_smoothed[sec]['selection'] += w_b * (r_p - r_b) * sm
+            sector_effects_smoothed[sec]['interaction'] += (w_p - w_b) * (r_p - r_b) * sm
+
+    # 組成輸出 DataFrame
+    rows = []
+    last_port_dict = sub_periods[-1]['port_sec'].set_index('sector').to_dict('index') if sub_periods else {}
+    last_bench = sub_periods[-1]['sectors_bench'] if sub_periods else {}
+    # 各 sector 整期 r_p / r_b 也用 Carino-smoothed sub-period 累加 (與 component 一致)
+    for sec in all_sectors:
+        # sector 整期 r_p (跨子期間 sub-period 報酬 × smoothing 之和)
+        sec_rp = sum(
+            (sp['port_sec'].set_index('sector').to_dict('index').get(sec, {}).get('r_p', 0) or 0) * sm
+            for sp, sm in zip(sub_periods, smoothing)
+        )
+        sec_rb = sum(
+            sp['sectors_bench'].get(sec, {}).get('r_b', 0) * sm
+            for sp, sm in zip(sub_periods, smoothing)
+        )
+        rows.append({
+            'sector': sec,
+            'w_p': last_port_dict.get(sec, {}).get('w_p', 0),
+            'w_b': last_bench.get(sec, {}).get('w_b', 0),
+            'r_p': sec_rp,
+            'r_b': sec_rb,
+            'allocation': sector_effects_smoothed[sec]['allocation'],
+            'selection': sector_effects_smoothed[sec]['selection'],
+            'interaction': sector_effects_smoothed[sec]['interaction'],
+        })
+    df = pd.DataFrame(rows)
+    df['w_active'] = df['w_p'] - df['w_b']
+    df['r_active'] = df['r_p'] - df['r_b']
+    df['total'] = df['allocation'] + df['selection'] + df['interaction']
+    df = df[df['sector'] != '其他'].copy()
+    df = df.sort_values('total', ascending=False).reset_index(drop=True)
+
+    summary = {
+        'allocation_total': total_alloc,
+        'selection_total': total_select,
+        'interaction_total': total_interact,
+        'r_p_compounded': R_p,
+        'r_b_compounded': R_b,
+        'active': R_active,
+        'residual': residual,
+        'sub_periods': sub_periods,
+        'smoothing': smoothing,
+        'sub_alloc_total': sub_alloc_total_list,
+        'sub_select_total': sub_select_total_list,
+        'sub_interact_total': sub_interact_total_list,
+        'sub_r_p_implied': sub_r_p_implied_list,
+        'sub_r_b_total': sub_r_b_total_list,
+    }
+    return df, summary
+
+
+def compute_brinson_self(d):
+    """
+    Brinson 2-component (Allocation + Selection 含 Interaction)
+
+      Allocation_i = (w_P,i - w_B,i) × (r_B,i - r_B_total)
+      Selection_i  = w_P,i × (r_P,i - r_B,i)
+      Σ = r_P_implied - r_B_total = Active Return
+
+    口徑:
+      - 組合: 用 期末 持股(庫存) 的 TOTAL_MV (權重) 與 TOTAL_PL / TOTAL_COST (報酬)
+      - 基準: 用 Bloomberg sectors 的 wt_bench, tr_bench (期間 cap-weighted)
+      - 個股 → sector mapping: 由 Bloomberg securities 的 (code → sector) 取得
+    """
+    h_end = d['h_end'].copy()
+    bb_secs = d['bb_securities'].copy()
     bb_sectors = d['bb_sectors'].copy()
+    bb_holdings = d['bb_holdings']
 
-    # Active = 產業報酬 + 個股選擇報酬 (Timing 已於資料載入時移除)
-    print(f"  Active Return (Bloomberg)         : {pct(t['bb_active_return'])}")
-    print(f"  ├─ 產業報酬 (industry)            : {pct(t['bb_industry_active'])}")
-    print(f"  └─ 個股選擇報酬 (selection)       : {pct(t['bb_selection_active'])}")
-    sum_check = (t['bb_industry_active'] or 0) + (t['bb_selection_active'] or 0)
-    print(f"  Σ 兩項                            : {pct(sum_check)}")
+    # ticker → sector mapping
+    if 'code' in bb_secs.columns:
+        bb_secs['_code'] = bb_secs['code'].apply(norm_ticker)
+        # 有 wt_port>0 的優先 (避免 share-class 重複歧義)
+        bb_sorted = bb_secs[bb_secs['_code'].notna()].sort_values(
+            'wt_port', ascending=False, na_position='last'
+        )
+        ticker_to_sector = {}
+        for _, r in bb_sorted.iterrows():
+            c = r['_code']
+            if c and c not in ticker_to_sector:
+                ticker_to_sector[c] = r['sector']
+    else:
+        ticker_to_sector = {}
+
+    h_end['sector'] = h_end['ticker'].map(ticker_to_sector).fillna('其他')
+
+    # 期內 max cost per ticker (峰值資本): 解決「期末 cost=0 但 pnl≠0 (已平倉)」的分母扭曲
+    ticker_max_cost = d['holdings'].groupby('ticker')['TOTAL_COST'].max()
+    h_end['_max_cost'] = h_end['ticker'].map(ticker_max_cost).fillna(0)
+
+    # 聚合 per-sector (組合側)
+    port = h_end.groupby('sector').agg(
+        mv=('TOTAL_MV', 'sum'),
+        cost_end=('TOTAL_COST', 'sum'),       # 期末 cost (僅現存部位)
+        capital=('_max_cost', 'sum'),         # 期內 max cost 加總 (峰值資本)
+        pnl=('TOTAL_PL', 'sum'),              # 含已平倉 P&L
+        n=('ticker', 'count'),
+    ).reset_index()
+
+    total_mv = h_end['TOTAL_MV'].sum()
+    port['w_p'] = port['mv'] / total_mv if total_mv else 0
+    port['r_p'] = port['pnl'] / port['capital'].replace(0, np.nan)
+
+    # 基準 per-sector (Bloomberg)
+    bench = bb_sectors[['name', 'wt_bench', 'tr_bench']].copy()
+    bench.columns = ['sector', 'w_b_pct', 'r_b_pct']
+    bench['w_b'] = bench['w_b_pct'] / 100  # Bloomberg 值為 %
+    bench['r_b'] = bench['r_b_pct'] / 100
+
+    df = port.merge(bench[['sector', 'w_b', 'r_b']], on='sector', how='outer')
+    df['w_p'] = df['w_p'].fillna(0)
+    df['w_b'] = df['w_b'].fillna(0)
+    df['cost_end'] = df['cost_end'].fillna(0)
+    df['capital'] = df['capital'].fillna(0)
+    df['mv'] = df['mv'].fillna(0)
+    df['pnl'] = df['pnl'].fillna(0)
+    df['n'] = df['n'].fillna(0).astype(int)
+
+    # r_B_total 取自 Bloomberg Holdings 列
+    r_b_total = float(bb_holdings['tr_bench']) / 100 if bb_holdings is not None else 0.0
+
+    # Brinson
+    df['r_p_clean'] = df['r_p'].fillna(0)
+    df['r_b_clean'] = df['r_b'].fillna(0)
+    df['w_active'] = df['w_p'] - df['w_b']
+    df['r_active'] = df['r_p_clean'] - df['r_b_clean']
+    df['allocation'] = df['w_active'] * (df['r_b_clean'] - r_b_total)
+    df['selection'] = df['w_p'] * (df['r_p_clean'] - df['r_b_clean'])
+    df['total'] = df['allocation'] + df['selection']
+
+    df = df.sort_values('total', ascending=False).reset_index(drop=True)
+
+    summary = {
+        'allocation_total': df['allocation'].sum(),
+        'selection_total': df['selection'].sum(),
+        'r_p_implied': (df['w_p'] * df['r_p_clean']).sum(),
+        'r_b_total': r_b_total,
+    }
+    summary['active'] = summary['r_p_implied'] - r_b_total
+
+    return df, summary, ticker_to_sector
+
+
+def section_attribution(d):
+    hr('5. Brinson 歸因 (自算; 多期 Carino 累乘)')
+
+    df, summary = compute_brinson_multiperiod(d, FP_BB)
+    if df is None:
+        # 退回單期計算
+        df, summary, _ = compute_brinson_self(d)
+        print("  [警告] Bloomberg 多 sheet 載入失敗, 退回單期計算")
+
+    t = d['totals']
+
+    n_sub = len(summary.get('sub_periods', []))
+    print(f"  子期間數: {n_sub} (相鄰 Bloomberg snapshot 之間)")
+    if n_sub > 0:
+        for i, sp in enumerate(summary['sub_periods'], 1):
+            r_p = summary['sub_r_p_implied'][i-1]
+            r_b = summary['sub_r_b_total'][i-1]
+            sm = summary['smoothing'][i-1]
+            print(f"    P{i}  {sp['date_start'].date()} → {sp['date_end'].date()}:"
+                  f"  r_P={r_p*100:+7.3f}%  r_B={r_b*100:+7.3f}%  Carino k_t/k={sm:.4f}")
     print()
-    sub('各 Sector 對 Active 的貢獻 (% pts)')
-    cols = ['name', 'wt_active', 'tr_active', 'industry_active', 'sel_active', 'ctr_active']
-    df = bb_sectors[cols].copy().sort_values('ctr_active', ascending=False)
-    df.columns = ['Sector', 'wActive%', 'rActive%', '產業報酬', '個股選擇', 'CTR']
-    for c in df.columns[1:]:
-        df[c] = df[c].apply(lambda x: f'{x:+7.3f}' if pd.notna(x) else '    n/a')
-    print(df.to_string(index=False))
+    print(f"  [口徑] 組合: 持股 daily snapshot, 子期間用 (avg MV / 子期間 max cost) 算 w_p, r_p")
+    print(f"         基準: Bloomberg 各 sheet (cumulative) → 子期間 r_B = (1+cum_t)/(1+cum_{{t-1}}) - 1")
+    print(f"         複合: Carino smoothing — sub effects × (k_t/k) 累加, 與 R_active 完美 reconcile")
     print()
-    print("  [說明] Bloomberg 採每日時間加權, 已內建處理成分股調整 / cash flow / 持倉變動.")
-    print("         本報告於資料載入時移除「時間報酬」(Timing) 欄位; Active = 產業報酬 + 個股選擇報酬.")
-    return bb_sectors
+    print()
+    alloc = summary.get('allocation_total', 0)
+    sel = summary.get('selection_total', 0)
+    interact = summary.get('interaction_total', 0)
+    sum_3 = alloc + sel + interact
+    r_p_compounded = summary.get('r_p_compounded', 0)
+    r_b_compounded = summary.get('r_b_compounded', 0)
+    self_active = summary.get('active', 0)
+    residual = summary.get('residual', self_active - sum_3)
+
+    print(f"  ★ Active Return 3 項拆解 (純自算, Carino linking):")
+    print(f"     Allocation  (Carino smoothed) : {pct(alloc)}")
+    print(f"     Selection   (Carino, w_B-based) : {pct(sel)}")
+    print(f"     Interaction (Carino)          : {pct(interact)}")
+    print(f"     ─────────────────────────────")
+    print(f"     Σ 3 項                        : {pct(sum_3)}")
+    print(f"     Residual (Carino 浮點誤差)    : {pct(residual)}")
+    print(f"     ─────────────────────────────")
+    print(f"     R_P − R_B (Self Active)       : {pct(self_active)}    ✓")
+    print()
+    print(f"  [Reference, 不參與歸因]")
+    print(f"  R_P (self compound, ∏(1+r_p,t)−1)        : {pct(r_p_compounded)}")
+    print(f"  R_B (self compound, ∏(1+r_b,t)−1)        : {pct(r_b_compounded)}")
+    print(f"  Bloomberg TWRR (Portfolio)               : {pct(t['bb_port_return'])}")
+    print(f"  Bloomberg TWRR (Benchmark)               : {pct(t['bb_bench_return'])}")
+    print()
+
+    sub('Per-sector breakdown')
+    # Total 重算為 3 項 (移除 Timing)
+    df['total'] = df['allocation'] + df['selection'] + df['interaction']
+    cols_to_show = ['sector', 'w_p', 'w_b', 'w_active', 'allocation', 'selection', 'interaction', 'total']
+    out = df[cols_to_show].copy()
+    fmt_w = lambda x: f'{x*100:+7.2f}'
+    fmt_brinson = lambda x: f'{x*100:+7.3f}' if pd.notna(x) and x != 0 else '   0.000'
+    for c in ['w_p', 'w_b', 'w_active']:
+        out[c] = out[c].apply(fmt_w)
+    for c in ['allocation', 'selection', 'interaction', 'total']:
+        out[c] = out[c].apply(fmt_brinson)
+    out.columns = ['Sector', 'wP%', 'wB%', 'wActive%',
+                   'Allocation', 'Selection', 'Interaction', 'Total']
+    print(out.to_string(index=False))
+
+    return df, summary
 
 
 # =============================================================
@@ -628,16 +1222,21 @@ def section_trades(d):
 # 8. 量化模型 Edge: 在倉持股 vs SPY 母體
 # =============================================================
 def section_quant_edge(d):
-    hr('7. 量化模型 Edge: 在倉持股 vs SPY 母體 (Bloomberg 證券層, wt_port>0 且在 SPY 內)')
+    hr('7. 量化模型 Edge: 在倉持股 vs SPY 母體 (Bloomberg 證券層, 期末權重 > 0 且在 SPY 內)')
     bb_secs = d['bb_securities'].copy()
+    # 統一用期末權重: 將 wt_port / wt_bench 覆寫為 end_wt_port / end_wt_bench
+    end_map_q = {'end_wt_port': 'wt_port', 'end_wt_bench': 'wt_bench'}
+    for src, dst in end_map_q.items():
+        if src in bb_secs.columns and bb_secs[src].notna().any():
+            bb_secs[dst] = bb_secs[src]
 
-    # SPY 母體 (wt_bench > 0)
+    # SPY 母體 (期末 wt_bench > 0)
     spy_universe = bb_secs[bb_secs['wt_bench'].notna() & (bb_secs['wt_bench'] > 0)].copy()
     spy_universe = spy_universe.dropna(subset=['tr_bench']).reset_index(drop=True)
     spy_universe['rank_full'] = spy_universe['tr_bench'].rank(pct=True) * 100
 
-    # 篩選: 投組平均權重 > 0 (Bloomberg wt_port > 0) 且 在 SPY 內 (wt_bench > 0)
-    # Off-Benchmark (wt_bench=0/NaN) 自動排除
+    # 篩選: 期末 wt_port > 0 (期末實際持有) 且 在 SPY 內
+    # Off-Benchmark (wt_bench=0/NaN) 自動排除; 期內已賣光的部位也自動排除 (end_wt_port=0)
     held_in_spy = bb_secs[
         bb_secs['wt_port'].notna() & (bb_secs['wt_port'] > 0) &
         bb_secs['wt_bench'].notna() & (bb_secs['wt_bench'] > 0)
@@ -662,7 +1261,7 @@ def section_quant_edge(d):
         hit_rate = mean_pct = pct_top25 = pct_above_50 = port_avg_uw = None
     spy_avg_uw = spy_universe['tr_bench'].mean()
 
-    sub('命中率 & SPY 百分位 (投組平均權重>0 ∩ SPY)')
+    sub('命中率 & SPY 百分位 (期末持有 ∩ SPY)')
     print(f"  命中率 (tr_port > 0)            : {int(profitable)} / {n_held_in_spy} = {pct(hit_rate, 1)}")
     print(f"  平均 SPY 百分位                 : {mean_pct:.1f}  (50 = 隨機選股)")
     print(f"  落在 SPY 上半 (>50)             : {pct_above_50:.1f}%")
@@ -672,7 +1271,7 @@ def section_quant_edge(d):
     print(f"  持股 SPY 部分等權平均 YTD%      : {pct(port_avg_uw/100 if port_avg_uw else None)}")
     print(f"  超額 (等權)                     : {pct((port_avg_uw - spy_avg_uw)/100 if port_avg_uw and spy_avg_uw else None)}")
 
-    sub(f'投組平均權重>0 部位於 SPY 母體的 YTD% 百分位 ({n_held_in_spy} 檔, sorted desc)')
+    sub(f'期末持有部位於 SPY 母體的 YTD% 百分位 ({n_held_in_spy} 檔, sorted desc)')
     rank_df = held_in_spy[['name', 'sector', 'wt_port', 'tr_port', 'rank_full']].copy()
     rank_df = rank_df.sort_values('rank_full', ascending=False)
     for c in ['wt_port', 'tr_port', 'rank_full']:
@@ -695,11 +1294,51 @@ def section_quant_edge(d):
             'avoided_bottom': len(bot_names - held_names),
         }
 
-    sub('量化模型亮點: 強漲股捕捉率 / 弱跌股迴避率')
-    print(f"  {'目標':<25} {'命中持有':>10} {'迴避':>10}")
+    # vs Random 基準: 若隨機從 SPY 母體選 N 檔 (我們持有 n_held_in_spy 檔), 期望命中 = N × n_held_in_spy / total_spy
+    n_spy_total = len(spy_universe)
     for N in [10, 20, 50]:
-        print(f"  SPY Top {N:<3} 漲幅 / Bottom {N:<3} 跌幅 :"
-              f"   {bright[N]['held_in_top']:>2}/{N:<3}     {bright[N]['avoided_bottom']:>2}/{N:<3}")
+        expected = N * n_held_in_spy / n_spy_total if n_spy_total else 0
+        bright[N]['expected_hit'] = expected
+        bright[N]['multiplier_hit'] = (bright[N]['held_in_top'] / expected) if expected > 0 else None
+        # avoid: 隨機 n_held 檔 → 期望落入 Bottom N 也是 N × n_held / total; avoided = N - expected_hit_bottom
+        expected_avoid = N - expected  # 隨機選 n_held 個, Bottom N 不在持股名單中的期望
+        bright[N]['expected_avoid'] = expected_avoid
+        bright[N]['multiplier_avoid'] = (bright[N]['avoided_bottom'] / expected_avoid) if expected_avoid > 0 else None
+
+    # IC (Information Coefficient): Spearman rank correlation via rank().corr()
+    # 跨整個 SPY 母體, 對 (portfolio_weight, stock_return) 計算 rank correlation
+    spy_universe_w_port = spy_universe.copy()
+    if 'wt_port' in spy_universe_w_port.columns:
+        spy_universe_w_port['_wt_port'] = spy_universe_w_port['wt_port'].fillna(0)
+    else:
+        spy_universe_w_port['_wt_port'] = 0.0
+    if len(spy_universe_w_port) > 2:
+        rank_w = spy_universe_w_port['_wt_port'].rank()
+        rank_r = spy_universe_w_port['tr_bench'].rank()
+        ic_spearman = float(rank_w.corr(rank_r))
+    else:
+        ic_spearman = None
+    # held-only IC: 只看持有部位 weight vs return rank
+    if n_held_in_spy >= 3:
+        rk_w = held_in_spy['wt_port'].rank()
+        rk_r = held_in_spy['tr_port'].rank()
+        ic_held = float(rk_w.corr(rk_r))
+    else:
+        ic_held = None
+
+    sub('量化模型亮點: 強漲股捕捉率 / 弱跌股迴避率 (含 vs Random 顯著性)')
+    print(f"  {'目標':<28} {'命中':>8} {'隨機期望':>10} {'倍數':>8}")
+    for N in [10, 20, 50]:
+        m = bright[N]['multiplier_hit']
+        m_str = f"{m:.1f}x" if m is not None else 'n/a'
+        print(f"  SPY Top {N:<3} 漲幅命中 :    {bright[N]['held_in_top']:>3}/{N:<3}  {bright[N]['expected_hit']:>8.2f}  {m_str:>8}")
+    for N in [10, 20, 50]:
+        m = bright[N]['multiplier_avoid']
+        m_str = f"{m:.1f}x" if m is not None else 'n/a'
+        print(f"  SPY Bot {N:<3} 跌幅迴避 :    {bright[N]['avoided_bottom']:>3}/{N:<3}  {bright[N]['expected_avoid']:>8.2f}  {m_str:>8}")
+    print()
+    print(f"  IC (全 SPY, Spearman wt_port × tr_bench) : {ic_spearman:+.3f}" if ic_spearman is not None else "  IC: n/a")
+    print(f"  IC (僅持有 24 檔, Spearman wt × ret)      : {ic_held:+.3f}" if ic_held is not None else "  IC (held): n/a")
     print()
 
     # 持有的 SPY Top 20 漲幅 (亮點 — 量化模型抓到的贏家)
@@ -753,8 +1392,13 @@ def section_quant_edge(d):
         'bright': {N: {
             'held_in_top': bright[N]['held_in_top'],
             'avoided_bottom': bright[N]['avoided_bottom'],
+            'expected_hit': bright[N]['expected_hit'],
+            'expected_avoid': bright[N]['expected_avoid'],
+            'multiplier_hit': bright[N]['multiplier_hit'],
+            'multiplier_avoid': bright[N]['multiplier_avoid'],
         } for N in [10, 20, 50]},
         'n_held_in_spy': n_held_in_spy,
+        'n_spy_total': n_spy_total,
         'n_profitable_in_spy': int(profitable),
         'hit_rate': hit_rate,
         'mean_pct': mean_pct,
@@ -762,6 +1406,8 @@ def section_quant_edge(d):
         'pct_above_50': pct_above_50,
         'port_avg_uw': port_avg_uw,
         'spy_avg_uw': spy_avg_uw,
+        'ic_spearman': ic_spearman,
+        'ic_held': ic_held,
     }
 
 
@@ -778,7 +1424,34 @@ def main():
     results['holdings'] = section_holdings(d)
     results['daily'] = section_daily(d)
     results['sector_df'] = section_sector(d)
-    results['attribution'] = section_attribution(d)
+    brinson_df, brinson_summary = section_attribution(d)
+    results['attribution'] = brinson_df
+    results['brinson_summary'] = brinson_summary
+    # Daily TWRR 三種 CF timing 假設 (僅用於說明頁面對比, 不影響主要計算)
+    pmv = d['holdings'].groupby('DATE_')['TOTAL_MV'].sum().sort_index()
+    pcf = d['trades'].groupby('交易日期')['signed_amount'].sum().reindex(pmv.index, fill_value=0)
+    mv_pv = pmv.shift(1)
+    def _twrr(denom):
+        r = (pmv - mv_pv - pcf) / denom
+        r = r.fillna(0); r.iloc[0] = 0
+        return float((1 + r).prod() - 1)
+    results['perf']['twrr_cf_end']    = _twrr(mv_pv.where(mv_pv > 0))
+    results['perf']['twrr_cf_middle'] = _twrr((mv_pv + 0.5 * pcf).where((mv_pv + 0.5 * pcf) > 0))
+    results['perf']['twrr_cf_start']  = _twrr((mv_pv + pcf).where((mv_pv + pcf) > 0))
+
+    # 把 perf 全部歸因相關數字換成自算 (HTML 與 console 一致, 不再採用 Bloomberg 計算的歸因/TWRR)
+    results['perf']['port_return'] = brinson_summary.get('r_p_compounded', results['perf']['port_return'])
+    results['perf']['spy_return']  = brinson_summary.get('r_b_compounded', results['perf']['spy_return'])
+    results['perf']['active_return'] = brinson_summary.get('active', results['perf']['active_return'])
+    results['perf']['industry_active'] = brinson_summary.get('allocation_total', 0)
+    results['perf']['selection_active'] = brinson_summary.get('selection_total', 0)
+    results['perf']['interaction_active'] = brinson_summary.get('interaction_total', 0)
+    results['perf']['residual_active'] = brinson_summary.get('residual', 0)
+    results['perf']['active_return_brinson'] = brinson_summary.get('active', 0)
+    # 保留 Bloomberg 的 TWRR 作為 reference (不參與歸因)
+    results['perf']['bb_port_return'] = d['totals'].get('bb_port_return')
+    results['perf']['bb_bench_return'] = d['totals'].get('bb_bench_return')
+    results['perf']['bb_active_return'] = d['totals'].get('bb_active_return')
     results['trades'] = section_trades(d)
     results['quant'] = section_quant_edge(d)
 
