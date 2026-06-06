@@ -1222,21 +1222,22 @@ def section_trades(d):
 # 8. 量化模型 Edge: 在倉持股 vs SPY 母體
 # =============================================================
 def section_quant_edge(d):
-    hr('7. 量化模型 Edge: 在倉持股 vs SPY 母體 (Bloomberg 證券層, 期末權重 > 0 且在 SPY 內)')
+    hr('7. 量化模型 Edge: 期內持有過的全部持股 vs SPY 母體 (Bloomberg, wt_port 期間平均 > 0)')
     bb_secs = d['bb_securities'].copy()
-    # 統一用期末權重: 將 wt_port / wt_bench 覆寫為 end_wt_port / end_wt_bench
-    end_map_q = {'end_wt_port': 'wt_port', 'end_wt_bench': 'wt_bench'}
-    for src, dst in end_map_q.items():
-        if src in bb_secs.columns and bb_secs[src].notna().any():
-            bb_secs[dst] = bb_secs[src]
+    # 保留原 Bloomberg 期間平均權重 (含中間賣掉的部位 wt_port>0, 但 end_wt_port=0)
+    # 不再覆寫為 end_wt_*, 因為要納入「期內曾持有過」的所有部位 (包含 sold during period)
 
-    # SPY 母體 (期末 wt_bench > 0)
-    spy_universe = bb_secs[bb_secs['wt_bench'].notna() & (bb_secs['wt_bench'] > 0)].copy()
+    # SPY 母體 (期末 wt_bench > 0, 用期末 universe 因為 SPY 成分有可能增刪)
+    if 'end_wt_bench' in bb_secs.columns and bb_secs['end_wt_bench'].notna().any():
+        spy_universe = bb_secs[bb_secs['end_wt_bench'].notna() & (bb_secs['end_wt_bench'] > 0)].copy()
+        spy_universe['wt_bench_use'] = spy_universe['end_wt_bench']
+    else:
+        spy_universe = bb_secs[bb_secs['wt_bench'].notna() & (bb_secs['wt_bench'] > 0)].copy()
+        spy_universe['wt_bench_use'] = spy_universe['wt_bench']
     spy_universe = spy_universe.dropna(subset=['tr_bench']).reset_index(drop=True)
     spy_universe['rank_full'] = spy_universe['tr_bench'].rank(pct=True) * 100
 
-    # 篩選: 期末 wt_port > 0 (期末實際持有) 且 在 SPY 內
-    # Off-Benchmark (wt_bench=0/NaN) 自動排除; 期內已賣光的部位也自動排除 (end_wt_port=0)
+    # 篩選: 期間平均 wt_port > 0 (期內曾持有過, 含中間賣掉) 且 在 SPY 內
     held_in_spy = bb_secs[
         bb_secs['wt_port'].notna() & (bb_secs['wt_port'] > 0) &
         bb_secs['wt_bench'].notna() & (bb_secs['wt_bench'] > 0)
@@ -1382,6 +1383,180 @@ def section_quant_edge(d):
         avoided_disp[c] = avoided_disp[c].apply(lambda x: f'{x:+7.2f}' if pd.notna(x) else '   n/a')
     print(avoided_disp.to_string(index=False))
 
+    # ============================================================
+    # 擴展母體 = SPY 母體 + 我方 Off-SPY 期末持有
+    # 用此 universe 重新評估「全部持股 (in-SPY + off-SPY)」, 取代 SPY-only 指標
+    # ============================================================
+    off_spy = bb_secs[
+        bb_secs['wt_port'].notna() & (bb_secs['wt_port'] > 0) &
+        ((bb_secs['wt_bench'].isna()) | (bb_secs['wt_bench'] == 0))
+    ].copy()
+    # 建擴展 universe — 用 code (BBG ticker) 當 unique key, 避免 share-class 同名重複 (GOOGL/GOOG 都叫 Alphabet公司)
+    spy_part = spy_universe[['code', 'name', 'sector', 'tr_bench']].copy()
+    spy_part.columns = ['code', 'name', 'sector', '_tr_ext']
+    spy_part['_in_spy'] = True
+    off_part = off_spy[['code', 'name', 'sector', 'tr_port']].copy() if len(off_spy) > 0 else pd.DataFrame(columns=['code','name','sector','tr_port'])
+    if len(off_part):
+        off_part.columns = ['code', 'name', 'sector', '_tr_ext']
+        off_part['_in_spy'] = False
+    ext_universe = pd.concat([spy_part, off_part], ignore_index=True).dropna(subset=['_tr_ext']).reset_index(drop=True)
+    # 以 code 去重 (保險防 SPY 母體本身有重複)
+    ext_universe = ext_universe.drop_duplicates(subset=['code']).reset_index(drop=True)
+    ext_universe['rank_ext'] = ext_universe['_tr_ext'].rank(pct=True) * 100
+    n_ext_universe = len(ext_universe)
+
+    # 全部持股 (in-SPY + off-SPY) — 用 code 去重 + merge
+    all_held = bb_secs[bb_secs['wt_port'].notna() & (bb_secs['wt_port'] > 0)].copy()
+    all_held = all_held.drop_duplicates(subset=['code']).reset_index(drop=True)
+    all_held = all_held.merge(ext_universe[['code', 'rank_ext']], on='code', how='left')
+    n_all_held = len(all_held)
+    profitable_all = int((all_held['tr_port'] > 0).sum())
+    hit_rate_all = profitable_all / n_all_held if n_all_held else 0
+    mean_rank_all = all_held['rank_ext'].mean() if n_all_held else None
+    pct_top25_all = (all_held['rank_ext'] > 75).sum() / n_all_held * 100 if n_all_held else 0
+    pct_above_50_all = (all_held['rank_ext'] > 50).sum() / n_all_held * 100 if n_all_held else 0
+    port_avg_uw_all = all_held['tr_port'].mean() if n_all_held else 0
+    ext_avg_uw = ext_universe['_tr_ext'].mean() if n_ext_universe else 0
+
+    # 擴展母體 Top/Bottom N 捕捉率 — 用 code 去重比對, 避免同名 share-class 干擾
+    bright_ext = {}
+    held_codes_all = set(all_held['code'].astype(str).str.strip())
+    for N in [10, 20, 50]:
+        top_n_codes = set(ext_universe.nlargest(N, '_tr_ext')['code'].astype(str).str.strip())
+        bot_n_codes = set(ext_universe.nsmallest(N, '_tr_ext')['code'].astype(str).str.strip())
+        expected_e = N * n_all_held / n_ext_universe if n_ext_universe else 0
+        bright_ext[N] = {
+            'held_in_top': len(top_n_codes & held_codes_all),
+            'avoided_bottom': len(bot_n_codes - held_codes_all),
+            'expected_hit': expected_e,
+            'expected_avoid': N - expected_e,
+            'multiplier_hit': (len(top_n_codes & held_codes_all) / expected_e) if expected_e > 0 else None,
+            'multiplier_avoid': ((len(bot_n_codes - held_codes_all)) / (N - expected_e)) if (N - expected_e) > 0 else None,
+        }
+
+    # 擴展母體 IC (Spearman): 用 code 對應 wt_port, 防止同名 share-class 把未持有的也賦予權重
+    held_w_dict = dict(zip(all_held['code'].astype(str).str.strip(), all_held['wt_port'].fillna(0)))
+    ext_universe['_wt_port'] = ext_universe['code'].astype(str).str.strip().map(lambda c: held_w_dict.get(c, 0))
+    if len(ext_universe) > 2:
+        rk_w_ext = ext_universe['_wt_port'].rank()
+        rk_r_ext = ext_universe['_tr_ext'].rank()
+        ic_ext = float(rk_w_ext.corr(rk_r_ext))
+    else:
+        ic_ext = None
+    if n_all_held >= 3:
+        rk_w_all = all_held['wt_port'].rank()
+        rk_r_all = all_held['tr_port'].rank()
+        ic_all_held = float(rk_w_all.corr(rk_r_all))
+    else:
+        ic_all_held = None
+
+    sub('擴展母體 (SPY + Off-SPY 持有) 評估 — 全部持股 (in-SPY + off-SPY)')
+    print(f"  擴展母體 = SPY ({len(spy_universe)}) + Off-SPY 持有 ({len(off_spy)}) = {n_ext_universe} 檔")
+    print(f"  全部持股 (n_all_held)             : {n_all_held} 檔 (in-SPY {n_held_in_spy} + off-SPY {len(off_spy)})")
+    print(f"  選股勝率 (tr_port > 0)            : {profitable_all} / {n_all_held} = {hit_rate_all*100:.1f}%")
+    print(f"  等權平均 YTD                      : {port_avg_uw_all:+.2f}%  vs 擴展母體等權 {ext_avg_uw:+.2f}%  超額 {port_avg_uw_all - ext_avg_uw:+.2f} pp")
+    print(f"  平均擴展母體排名                  : 第 {mean_rank_all:.1f} 百分位 (前 1/4 占 {pct_top25_all:.1f}%)")
+    print(f"  Top 20 漲幅 命中                  : {bright_ext[20]['held_in_top']} / 20 ({bright_ext[20]['multiplier_hit']:.1f}x random)" if bright_ext[20]['multiplier_hit'] else 'n/a')
+    print(f"  Bottom 20 跌幅 暴露 (持有 N)      : {20 - bright_ext[20]['avoided_bottom']} / 20")
+    print(f"  IC (擴展母體, Spearman)           : {ic_ext:+.3f}" if ic_ext is not None else 'n/a')
+    print(f"  IC (僅持有 {n_all_held} 檔)               : {ic_all_held:+.3f}" if ic_all_held is not None else 'n/a')
+    print()
+
+    # ============================================================
+    # 持有期間對照: 用同期間 SPY 報酬作為公平基準
+    # ============================================================
+    holdings_df = d['holdings']
+    period_end = d['totals']['period_end']
+    period_start = d['totals']['period_start']
+    period_days = (period_end - period_start).days
+    spy_full = (d['totals'].get('bb_bench_return') or 0)  # SPY 全期 TWRR
+    # SPY 等效 daily 複利率
+    if period_days > 0 and (1 + spy_full) > 0:
+        spy_daily_compound = (1 + spy_full) ** (1.0/period_days) - 1
+    else:
+        spy_daily_compound = 0
+    # 每 ticker 首次與最後持有日期 (MV>0); sold positions 的 last_day < period_end
+    held_dates = holdings_df[holdings_df['TOTAL_MV'] > 0].groupby('ticker')['DATE_'].agg(['min', 'max']).to_dict('index')
+
+    all_held = all_held.copy()
+    all_held['_ticker'] = all_held['code'].apply(lambda c: str(c).strip() if pd.notna(c) else None)
+    all_held['_first_day'] = all_held['_ticker'].apply(lambda t: held_dates.get(t, {}).get('min') if t else None)
+    all_held['_last_day'] = all_held['_ticker'].apply(lambda t: held_dates.get(t, {}).get('max') if t else None)
+    all_held['_days_held'] = all_held.apply(
+        lambda r: (r['_last_day'] - r['_first_day']).days if pd.notna(r['_first_day']) and pd.notna(r['_last_day']) else period_days,
+        axis=1
+    )
+    # 標註是否仍在帳 (期末持有) — 用 days_held 判斷較不可靠, 直接看 end_wt_port
+    all_held['_still_held'] = all_held.get('end_wt_port', pd.Series([0]*len(all_held))).fillna(0) > 0
+    # SPY 同期間複利報酬 (從 first_day 到 last_day)
+    all_held['_spy_window_ret'] = all_held['_days_held'].apply(
+        lambda d: ((1 + spy_daily_compound) ** d - 1) * 100 if d > 0 else 0
+    )
+    all_held['_window_excess'] = all_held['tr_port'] - all_held['_spy_window_ret']
+
+    # 持有時點旗標: 期初 / 期中 / 期末 (各檢查當天 TOTAL_MV > 0)
+    holdings_dates = sorted(holdings_df['DATE_'].unique())
+    mid_date = holdings_dates[len(holdings_dates) // 2] if holdings_dates else None
+    held_at_start = set(holdings_df[(holdings_df['DATE_'] == period_start) & (holdings_df['TOTAL_MV'] > 0)]['ticker'])
+    held_at_mid = set(holdings_df[(holdings_df['DATE_'] == mid_date) & (holdings_df['TOTAL_MV'] > 0)]['ticker']) if mid_date is not None else set()
+    held_at_end = set(holdings_df[(holdings_df['DATE_'] == period_end) & (holdings_df['TOTAL_MV'] > 0)]['ticker'])
+    all_held['_at_start'] = all_held['_ticker'].apply(lambda t: t in held_at_start)
+    all_held['_at_mid'] = all_held['_ticker'].apply(lambda t: t in held_at_mid)
+    all_held['_at_end'] = all_held['_ticker'].apply(lambda t: t in held_at_end)
+
+    n_beat_window = int((all_held['_window_excess'] > 0).sum())
+    win_excess_avg = float(all_held['_window_excess'].mean())
+    win_excess_weighted = float((all_held['wt_port'] * all_held['_window_excess']).sum() / all_held['wt_port'].sum()) if all_held['wt_port'].sum() else 0
+
+    sub('持有期間對照 (SPY 同窗口報酬作公平基準)')
+    print(f"  SPY 全期 TWRR              : {spy_full*100:+.2f}%  ({period_days} 天)")
+    print(f"  SPY 等效 daily 複利率      : {spy_daily_compound*100:+.4f}% / 天")
+    print(f"  跑贏同窗口 SPY 的檔數      : {n_beat_window} / {n_all_held} = {n_beat_window/n_all_held*100:.1f}%")
+    print(f"  平均同窗口超額 (等權)      : {win_excess_avg:+.2f} pp")
+    print(f"  平均同窗口超額 (權重加權)  : {win_excess_weighted:+.2f} pp")
+    print()
+    # 補入 sector 平均 SPY 報酬率作對照
+    sector_avg = spy_universe.groupby('sector')['tr_bench'].mean().to_dict()
+    if len(off_spy) > 0 and 'sector' in off_spy.columns:
+        off_spy['sector_avg_spy'] = off_spy['sector'].map(sector_avg)
+        off_spy['excess_vs_sector'] = off_spy['tr_port'] - off_spy['sector_avg_spy']
+
+    sub('Off-SPY 持股評估 (期末持有但不在 SPY 母體)')
+    if len(off_spy) > 0:
+        n_off = len(off_spy)
+        win_off = int((off_spy['tr_port'] > 0).sum())
+        avg_off = off_spy['tr_port'].mean()
+        beat_sector_n = int((off_spy['excess_vs_sector'] > 0).sum())
+        weighted_avg = (off_spy['wt_port'] * off_spy['tr_port']).sum() / off_spy['wt_port'].sum() if off_spy['wt_port'].sum() else 0
+        print(f"  Off-SPY 檔數                : {n_off}")
+        print(f"  期末權重合計                : {off_spy['wt_port'].sum():.2f}%")
+        print(f"  勝率 (tr_port > 0)          : {win_off} / {n_off} = {win_off/n_off*100:.1f}%")
+        print(f"  等權平均 YTD%               : {avg_off:+.2f}%")
+        print(f"  權重加權平均 YTD%           : {weighted_avg:+.2f}%")
+        print(f"  跑贏同產業 SPY 平均的檔數   : {beat_sector_n} / {n_off}")
+        print(f"  SPY 母體等權平均 YTD%       : {spy_avg_uw:+.2f}% (參考)")
+        print()
+        off_disp = off_spy[['name', 'sector', 'wt_port', 'tr_port', 'sector_avg_spy', 'excess_vs_sector']].copy()
+        off_disp = off_disp.sort_values('tr_port', ascending=False)
+        for c in ['wt_port', 'tr_port', 'sector_avg_spy', 'excess_vs_sector']:
+            off_disp[c] = off_disp[c].apply(lambda x: f'{x:+7.2f}' if pd.notna(x) else '   n/a')
+        off_disp.columns = ['名稱', 'Sector', '組合權重%', 'YTD%', '同產業SPY平均%', '超額%']
+        print(off_disp.to_string(index=False))
+        off_spy_stats = {
+            'n': n_off,
+            'wt_sum': float(off_spy['wt_port'].sum()),
+            'win_count': win_off,
+            'win_rate': win_off / n_off,
+            'avg_uw': float(avg_off),
+            'weighted_avg': float(weighted_avg),
+            'beat_sector_n': beat_sector_n,
+            'detail': off_spy.sort_values('tr_port', ascending=False),
+        }
+    else:
+        print('  (無 Off-SPY 持股)')
+        off_spy_stats = None
+    print()
+
     return {
         'spy_universe': spy_universe,
         'held_in_spy': held_in_spy.sort_values('rank_full', ascending=False),
@@ -1408,6 +1583,35 @@ def section_quant_edge(d):
         'spy_avg_uw': spy_avg_uw,
         'ic_spearman': ic_spearman,
         'ic_held': ic_held,
+        'off_spy_stats': off_spy_stats,
+        # 擴展母體 (SPY + Off-SPY 持有) 評估指標
+        'ext': {
+            'n_universe': n_ext_universe,
+            'n_off_spy_held': len(off_spy),
+            'n_all_held': n_all_held,
+            'hit_rate': hit_rate_all,
+            'profitable_all': profitable_all,
+            'mean_rank': mean_rank_all,
+            'pct_top25': pct_top25_all,
+            'pct_above_50': pct_above_50_all,
+            'port_avg_uw': port_avg_uw_all,
+            'ext_avg_uw': ext_avg_uw,
+            'excess_uw': port_avg_uw_all - ext_avg_uw,
+            'bright': bright_ext,
+            'ic_ext': ic_ext,
+            'ic_all_held': ic_all_held,
+        },
+        # 持有窗口公平對照
+        'window': {
+            'spy_full_return': spy_full * 100,
+            'period_days': period_days,
+            'spy_daily_compound': spy_daily_compound * 100,
+            'n_beat_window': n_beat_window,
+            'n_all_held': n_all_held,
+            'win_excess_avg': win_excess_avg,
+            'win_excess_weighted': win_excess_weighted,
+            'detail': all_held[['name', 'sector', '_first_day', '_last_day', '_days_held', 'wt_port', 'tr_port', '_spy_window_ret', '_window_excess', '_at_start', '_at_mid', '_at_end']].copy(),
+        },
     }
 
 

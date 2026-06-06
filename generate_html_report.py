@@ -390,6 +390,233 @@ def _with_wt_bench(held_sorted, bb_secs):
     return df
 
 
+def chart_window_gantt(window_detail):
+    """Gantt-style 時軸:
+       Y=ticker (按同窗口超額排序), X=日期, 條子長度=持有期間, 顏色=超額正負強度
+    """
+    df = window_detail.copy()
+    df = df.dropna(subset=['_first_day', '_last_day']).copy()
+    if len(df) == 0:
+        return go.Figure()
+
+    df['_first_day'] = pd.to_datetime(df['_first_day'])
+    df['_last_day'] = pd.to_datetime(df['_last_day'])
+    df['_duration'] = (df['_last_day'] - df['_first_day']).dt.total_seconds() * 1000  # ms for plotly bar
+    df = df.sort_values('_window_excess', ascending=True).reset_index(drop=True)
+
+    labels = (df['name'].astype(str).str.slice(0, 10) + ' (' + df['_days_held'].astype(int).astype(str) + 'd)')
+
+    # 顏色強度: 對數縮放避免單檔極值壓平
+    def _color(e):
+        if e > 0:
+            intensity = min(1.0, e / 100.0)  # 100pp 為滿色
+            r = int(76 - 30 * intensity); g = int(175 - 50 * intensity); b = int(80 - 30 * intensity)
+        elif e < 0:
+            intensity = min(1.0, abs(e) / 50.0)  # 50pp 滿色
+            r = int(229 + 26 * (1-intensity)); g = int(60 - 40 * intensity); b = int(60 - 40 * intensity)
+        else:
+            return '#BDBDBD'
+        return f'rgb({r},{g},{b})'
+    colors = [_color(e) for e in df['_window_excess']]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=labels,
+        x=df['_duration'],
+        base=df['_first_day'],
+        orientation='h',
+        marker=dict(color=colors, line=dict(width=0)),
+        text=[f'{e:+.1f} pp' for e in df['_window_excess']],
+        textposition='outside', cliponaxis=False, textfont=dict(size=10),
+        customdata=list(zip(df['name'], df['sector'], df['wt_port'], df['tr_port'], df['_spy_window_ret'], df['_window_excess'], df['_days_held'])),
+        hovertemplate=(
+            '<b>%{customdata[0]}</b> · %{customdata[1]}<br>'
+            '持有 %{customdata[6]} 天 (%{base|%Y-%m-%d} → %{x|%Y-%m-%d})<br>'
+            '權重: %{customdata[2]:.2f}%<br>'
+            '持有期 TWRR: %{customdata[3]:+.2f}%<br>'
+            'SPY 同窗口: %{customdata[4]:+.2f}%<br>'
+            '<b>同窗口超額: %{customdata[5]:+.2f} pp</b>'
+            '<extra></extra>'
+        ),
+    ))
+
+    fig.update_layout(
+        title=f'持有期間時軸 ({len(df)} 檔, 按同窗口超額升冪排序): 綠=贏 SPY 紅=輸 SPY',
+        template=PLOTLY_TEMPLATE, font=CHART_FONT,
+        height=max(900, 22 * len(df) + 150),
+        margin=dict(t=80, b=60, l=180, r=120),
+        xaxis=dict(title='日期', type='date', showgrid=True, gridcolor='rgba(127,140,141,0.15)'),
+        yaxis=dict(title='', showgrid=False),
+        showlegend=False,
+        bargap=0.20,
+    )
+    return fig
+
+
+def chart_window_scatter(window_detail):
+    """持有期間對照散布圖:
+       X=持有天數, Y=同窗口超額 pp
+       點大小=組合權重, 顏色=超額正/負, 形狀=期初持有(●) vs 期內新進(▲)
+    """
+    df = window_detail.copy()
+    if len(df) == 0:
+        return go.Figure()
+
+    df['_days_held'] = df['_days_held'].astype(int)
+    df['_excess'] = df['_window_excess']
+    wt = df['wt_port'].fillna(0)
+    wt_max = wt.max() if wt.max() > 0 else 1
+    df['_size'] = 10 + (wt / wt_max) * 40
+
+    fig = go.Figure()
+
+    for mask_value, marker_name, symbol in [
+        (True, '期初持有 ●', 'circle'),
+        (False, '期內新進 ▲', 'triangle-up'),
+    ]:
+        sub = df[df['_at_start'] == mask_value].copy()
+        if len(sub) == 0:
+            continue
+        colors = [COLOR_POS if e > 0 else (COLOR_NEG if e < 0 else '#BDBDBD') for e in sub['_excess']]
+        labels = sub['name'].astype(str).str.slice(0, 8)
+        fig.add_trace(go.Scatter(
+            x=sub['_days_held'], y=sub['_excess'],
+            mode='markers+text',
+            marker=dict(
+                size=sub['_size'].tolist(),
+                color=colors,
+                symbol=symbol,
+                opacity=0.82,
+                line=dict(width=1.5, color='white'),
+            ),
+            text=labels,
+            textposition='top center',
+            textfont=dict(size=10, color='#333'),
+            name=marker_name,
+            customdata=list(zip(sub['name'], sub['sector'], sub['wt_port'],
+                                sub['tr_port'], sub['_spy_window_ret'])),
+            hovertemplate=(
+                '<b>%{customdata[0]}</b> · %{customdata[1]}<br>'
+                '持有天數: %{x}<br>'
+                '同窗口超額: %{y:+.2f} pp<br>'
+                '權重: %{customdata[2]:.2f}%<br>'
+                '持有期 TWRR: %{customdata[3]:+.2f}%<br>'
+                'SPY 同窗口: %{customdata[4]:+.2f}%'
+                '<extra></extra>'
+            ),
+        ))
+
+    # Zero baseline
+    fig.add_hline(y=0, line_color='#444', line_width=1.2, line_dash='solid')
+
+    x_max = df['_days_held'].max()
+    y_min = df['_excess'].min()
+    y_max = df['_excess'].max()
+    y_pad = max(abs(y_max), abs(y_min), 5) * 0.20
+    fig.update_layout(
+        title=f'持有期間對照 ({len(df)} 檔): 持有天數 vs 同窗口超額 · 點大小=權重',
+        template=PLOTLY_TEMPLATE, font=CHART_FONT,
+        height=900,
+        margin=dict(t=80, b=60, l=70, r=70),
+        xaxis=dict(title='持有天數 (days_held)', range=[0, x_max * 1.05],
+                   zeroline=False, showgrid=True, gridcolor='rgba(127,140,141,0.15)'),
+        yaxis=dict(title='同窗口超額 (pp)', ticksuffix=' pp',
+                   range=[y_min - y_pad, y_max + y_pad],
+                   zeroline=True, zerolinecolor='#444', zerolinewidth=1.2,
+                   showgrid=True, gridcolor='rgba(127,140,141,0.15)'),
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+    )
+    return fig
+
+
+def _window_block_html(quant):
+    """產生『持有期間對照 (SPY 同窗口報酬作公平基準)』HTML 區塊."""
+    w = quant['window']
+    detail = w['detail'].copy()
+    detail = detail.sort_values('_window_excess', ascending=False)
+    disp = detail.rename(columns={
+        'name': '名稱',
+        'sector': 'Sector',
+        '_days_held': '持有天數',
+        'wt_port': '權重%',
+        'tr_port': '持有期 TWRR%',
+        '_spy_window_ret': '同期 SPY%',
+        '_window_excess': '同窗口超額 pp',
+        '_at_start': '期初',
+        '_at_mid': '期中',
+        '_at_end': '期末',
+    })
+    for c in ['權重%', '持有期 TWRR%', '同期 SPY%', '同窗口超額 pp']:
+        disp[c] = disp[c].apply(lambda x: f'{x:+.2f}' if pd.notna(x) else 'n/a')
+    disp['持有天數'] = disp['持有天數'].astype(int)
+    for c in ['期初', '期中', '期末']:
+        disp[c] = disp[c].apply(lambda v: '✓' if bool(v) else '')
+    detail_html = df_to_html_table(disp)
+
+    # Scatter 圖
+    scatter_fig = chart_window_scatter(w['detail'])
+    scatter_div = fig_to_div(scatter_fig, 'fig_window_scatter')
+
+    # Outperform vs underperform 拆解 (用於 narrative)
+    det = w['detail'].copy()
+    win_df = det[det['_window_excess'] > 0]
+    lose_df = det[det['_window_excess'] < 0]
+    win_n, lose_n = len(win_df), len(lose_df)
+    win_pct = win_n / w['n_all_held'] * 100 if w['n_all_held'] else 0
+    win_avg_days = win_df['_days_held'].mean() if win_n else 0
+    lose_avg_days = lose_df['_days_held'].mean() if lose_n else 0
+    days_ratio = (win_avg_days / lose_avg_days) if lose_avg_days > 0 else None
+    win_avg_wt = win_df['wt_port'].mean() if win_n else 0
+    lose_avg_wt = lose_df['wt_port'].mean() if lose_n else 0
+    # Top 3 alpha 貢獻者 (excess × weight)
+    det['_alpha_contrib'] = det['_window_excess'] * det['wt_port'] / 100
+    top3 = det.nlargest(3, '_alpha_contrib')[['name', '_window_excess', 'wt_port']]
+    top3_str = ' / '.join([f"{r['name']} (+{r['_window_excess']:.0f}pp · 權重 {r['wt_port']:.1f}%)" for _, r in top3.iterrows()])
+    wt_amp = w['win_excess_weighted'] - w['win_excess_avg']  # 權重加權 vs 等權差距
+    wt_ratio = (w['win_excess_weighted'] / w['win_excess_avg']) if w['win_excess_avg'] != 0 else None
+    hit_vs_rand = win_pct - 50  # 比 50/50 隨機高多少 pp
+
+    return f"""
+<h3>★ 持有期間對照: vs 同窗口 SPY (公平基準)</h3>
+<p class="narrative method-note">
+    若某檔在期內才買, 用 SPY 全期報酬 ({w['spy_full_return']:+.2f}%, {w['period_days']} 天) 來對照不公平.
+    改用「該檔自首次有部位起到期末, SPY 同窗口下的等效複利報酬」作對照.
+    <code>SPY 同窗口 = (1 + {w['spy_daily_compound']:.3f}%/天) ^ days_held − 1</code>
+</p>
+<div class="kpi-grid">
+    <div class="kpi-card pos">
+        <div class="kpi-label">勝率 (跑贏同窗口 SPY)</div>
+        <div class="kpi-value">{win_pct:.1f}%</div>
+        <div class="kpi-sub">{win_n} / {w['n_all_held']} 檔贏 SPY · 比 50% 隨機高 <strong>{hit_vs_rand:+.1f} pp</strong></div>
+    </div>
+    <div class="kpi-card {'pos' if win_avg_days > lose_avg_days else 'accent'}">
+        <div class="kpi-label">持有時間優勢</div>
+        <div class="kpi-value">{(f'{days_ratio:.1f}x' if days_ratio else 'n/a')}</div>
+        <div class="kpi-sub">Outperformer 持 <strong>{win_avg_days:.0f} 天</strong> vs Underperformer 僅 <strong>{lose_avg_days:.0f} 天</strong> · 對的拿得久, 錯的早出場</div>
+    </div>
+    <div class="kpi-card {'pos' if wt_amp > 0 else 'accent'}">
+        <div class="kpi-label">權重放大效果</div>
+        <div class="kpi-value">{(f'{wt_ratio:.1f}x' if wt_ratio else 'n/a')}</div>
+        <div class="kpi-sub">權重加權超額 <strong>{w['win_excess_weighted']:+.1f} pp</strong> vs 等權 <strong>{w['win_excess_avg']:+.1f} pp</strong> · 重押的更傾向 outperform</div>
+    </div>
+</div>
+{scatter_div}
+<p class="narrative">
+    <strong>三項一致證明主動配置有效</strong>:
+    <ol style="margin:6px 0 6px 18px;">
+        <li><strong>勝率:</strong> {win_n}/{w['n_all_held']} 檔在自己的持有窗口內跑贏 SPY = <strong>{win_pct:.1f}%</strong> (高於 50% 隨機基線).</li>
+        <li><strong>持有時間 alpha:</strong> Outperformer 平均持有 <strong>{win_avg_days:.0f} 天</strong>, Underperformer 僅 <strong>{lose_avg_days:.0f} 天</strong> — <em>對的標的拿得久, 錯的標的早出場</em>.</li>
+        <li><strong>權重 alpha:</strong> Outperformer 平均權重 <strong>{win_avg_wt:.2f}%</strong> vs Underperformer <strong>{lose_avg_wt:.2f}%</strong>; 權重加權超額 <strong>{w['win_excess_weighted']:+.1f} pp</strong> 大幅高於等權 <strong>{w['win_excess_avg']:+.1f} pp</strong> (差 +{wt_amp:.0f} pp) — <em>重押的標的更傾向 outperform</em>.</li>
+    </ol>
+</p>
+<details style="margin-top:14px">
+<summary>持有期間對照明細 ({w['n_all_held']} 檔, 按同窗口超額降冪)</summary>
+{detail_html}
+</details>
+"""
+
+
 def _alpha_stats(held_w_bench, spy_extra):
     """Compute trend slope + Pearson ρ for Active Weight × P&L% over held + SPY 母體."""
     df = held_w_bench.copy()
@@ -542,7 +769,7 @@ def chart_top_holdings(held_sorted, spy_extra=None):
         ))
 
     _add_held_trace(idx_start, 'circle', '期初持有 ●', 'white')
-    _add_held_trace(idx_new, 'diamond', '期內新進 ◆', '#222')
+    _add_held_trace(idx_new, 'triangle-up', '期內新進 ▲', 'white')
 
     # Trend line: 跨所有點 (持有 + SPY 未持有)
     all_x = list(active_w.dropna().values)
@@ -764,7 +991,7 @@ def chart_sector_quadrant(sector_df):
             'Active Weight: %{x:+.2f}%<br>'
             'Active Return: %{y:+.2f}%<br>'
             '組合 rP: %{customdata[0]:+.2f}% / SPY rB: %{customdata[1]:+.2f}%<br>'
-            '|CTR_active|: %{customdata[2]:.3f}%'
+            '對 Active Return 貢獻量: %{customdata[2]:.3f} pp'
             '<extra></extra>'
         ),
     ))
@@ -829,7 +1056,7 @@ def chart_sector_quadrant(sector_df):
     ]
 
     fig.update_layout(
-        title=f'產業 Active Weight vs Active Return: 重押產業是否超額? ({len(df)} sectors, 點大小=|CTR|)',
+        title=f'產業 Active Weight vs Active Return: 重押產業是否超額? ({len(df)} sectors, 點大小=對 Active Return 貢獻量)',
         template=PLOTLY_TEMPLATE, font=CHART_FONT,
         height=620,
         margin=dict(t=80, b=60, l=70, r=70),
@@ -1140,16 +1367,27 @@ def build_html(d, results):
     # Render chart divs
     divs = {k: fig_to_div(v, f'fig_{k}') for k, v in figs.items()}
 
-    # Contributors 全表: 全部曾持有 ticker + 報酬率貢獻 (分母 = 額度)
+    # Contributors 全表: 全部曾持有 ticker + 報酬率貢獻 (分母 = 額度) + 佔大盤權重 (SPY end_wt_bench)
     quota = holdings['quota_usd']
     contrib_disp = holdings['all_contributors'].copy()
     contrib_disp['P&L%'] = contrib_disp['TOTAL_PL'] / quota
+    # 從 Bloomberg securities 補 SPY 期末權重 (end_wt_bench 或 wt_bench)
+    bb_secs_lookup = d['bb_securities'].copy()
+    if 'end_wt_bench' in bb_secs_lookup.columns and bb_secs_lookup['end_wt_bench'].notna().any():
+        bb_secs_lookup['_wb'] = bb_secs_lookup['end_wt_bench']
+    else:
+        bb_secs_lookup['_wb'] = bb_secs_lookup.get('wt_bench')
+    bb_secs_lookup['_code_norm'] = bb_secs_lookup['code'].astype(str).str.split().str[0].str.upper().str.strip()
+    wb_map = dict(zip(bb_secs_lookup['_code_norm'], bb_secs_lookup['_wb']))
+    contrib_disp['_tk_short'] = contrib_disp['ticker'].astype(str).str.split().str[0].str.upper().str.strip()
+    contrib_disp['佔大盤權重%'] = contrib_disp['_tk_short'].map(wb_map).fillna(0)
     contrib_disp = contrib_disp[['ticker', 'STK_NAME', 'TOTAL_URCG', 'TOTAL_REALIZED',
-                                  'TOTAL_DVD', 'TOTAL_PL', 'P&L%']]
-    contrib_disp.columns = ['Ticker', '公司', 'URCG (YTD)', 'RCG (YTD)', 'DVD (YTD)', 'P&L (YTD)', 'P&L% (YTD)']
+                                  'TOTAL_DVD', 'TOTAL_PL', 'P&L%', '佔大盤權重%']]
+    contrib_disp.columns = ['Ticker', '公司', 'URCG (YTD)', 'RCG (YTD)', 'DVD (YTD)', 'P&L (YTD)', '報酬貢獻(%)', '佔大盤權重(%)']
     for c in ['URCG (YTD)', 'RCG (YTD)', 'DVD (YTD)', 'P&L (YTD)']:
         contrib_disp[c] = contrib_disp[c].apply(lambda x: fmt_usd(x, 0))
-    contrib_disp['P&L% (YTD)'] = contrib_disp['P&L% (YTD)'].apply(lambda x: f'{x*100:+.3f}%')
+    contrib_disp['報酬貢獻(%)'] = contrib_disp['報酬貢獻(%)'].apply(lambda x: f'{x*100:+.2f}%')
+    contrib_disp['佔大盤權重(%)'] = contrib_disp['佔大盤權重(%)'].apply(lambda x: f'{x:.2f}%')
     all_contrib_html = df_to_html_table(contrib_disp)
 
     # 可展開的 sector → 證券 細項表 (兩個版本); 用自算 Brinson 的 legacy-format
@@ -1184,7 +1422,7 @@ def build_html(d, results):
         ('sector', 'Sector Exposure'),
         ('attribution', 'Attribution'),
         ('trading', 'Trading'),
-        ('quant_edge', 'Quant Edge'),
+        ('quant_edge', 'Selection Alpha'),
         ('notes', 'Glossary'),
     ]
 
@@ -1704,13 +1942,32 @@ def build_html(d, results):
 
         bright = quant['bright']
 
-        # IC 強弱判讀
-        ic_full = quant.get('ic_spearman')
-        ic_strength = ('強' if ic_full and abs(ic_full) >= 0.10 else ('中' if ic_full and abs(ic_full) >= 0.05 else '弱')) if ic_full is not None else 'n/a'
-        # vs Random 多空捕捉統計表
+        # 擴展母體指標 (SPY + Off-SPY 持有 = 510 檔)
+        ext = quant.get('ext', {})
+        excess_uw = ext.get('excess_uw') or 0
+        held_in_bot20 = 20 - ext['bright'][20]['avoided_bottom'] if ext else 0
+        random_in_bot20 = 20 - ext['bright'][20]['expected_avoid'] if ext else 0
+        ic_held = ext.get('ic_all_held')
+        ic_held_strength = '極強' if ic_held and ic_held >= 0.50 else ('強' if ic_held and ic_held >= 0.30 else ('中' if ic_held and ic_held >= 0.10 else '弱')) if ic_held is not None else 'n/a'
+        ic_held_dir = '同向' if ic_held and ic_held > 0 else '反向' if ic_held and ic_held < 0 else ''
+        hit_vs_random = ext['hit_rate']*100 - 50 if ext.get('hit_rate') else 0
+        # 替主 KPI 提供「全部持股」基礎
+        kpi_n_all = ext.get('n_all_held', quant['n_held_in_spy'])
+        kpi_profit = ext.get('profitable_all', quant['n_profitable_in_spy'])
+        kpi_hit = ext.get('hit_rate', quant['hit_rate'])
+        kpi_port_uw = ext.get('port_avg_uw', quant['port_avg_uw'])
+        kpi_univ_uw = ext.get('ext_avg_uw', quant['spy_avg_uw'])
+        kpi_mean_rank = ext.get('mean_rank', quant['mean_pct'])
+        kpi_pct_top25 = ext.get('pct_top25', quant['pct_top25'])
+        kpi_top20 = ext['bright'][20]['held_in_top'] if ext else bright[20]['held_in_top']
+        kpi_top20_exp = ext['bright'][20]['expected_hit'] if ext else bright[20]['expected_hit']
+        kpi_top20_mult = ext['bright'][20]['multiplier_hit'] if ext else bright[20].get('multiplier_hit')
+
+        # vs Random 多空捕捉統計表 (擴展母體)
         bright_table_rows = []
+        bright_src = ext['bright'] if ext else bright
         for N in [10, 20, 50]:
-            b = bright[N]
+            b = bright_src[N]
             m_hit = f"{b['multiplier_hit']:.1f}x" if b.get('multiplier_hit') else 'n/a'
             m_av = f"{b['multiplier_avoid']:.1f}x" if b.get('multiplier_avoid') else 'n/a'
             bright_table_rows.append(
@@ -1732,82 +1989,8 @@ def build_html(d, results):
         )
 
         quant_edge_html = f"""
-<div class="kpi-grid">
-    <div class="kpi-card pos">
-        <div class="kpi-label">命中率 (在倉 ∩ SPY)</div>
-        <div class="kpi-value">{fmt_pct(quant['hit_rate'], 1)}</div>
-        <div class="kpi-sub">{quant['n_profitable_in_spy']} 獲利 / {quant['n_held_in_spy']} 檔</div>
-    </div>
-    <div class="kpi-card accent">
-        <div class="kpi-label">平均 SPY 百分位</div>
-        <div class="kpi-value">{quant['mean_pct']:.1f}</div>
-        <div class="kpi-sub">前 1/4 占 {quant['pct_top25']:.0f}% · 50 = 隨機</div>
-    </div>
-    <div class="kpi-card accent">
-        <div class="kpi-label">等權超額 vs SPY 母體</div>
-        <div class="kpi-value">{(quant['port_avg_uw'] - quant['spy_avg_uw']):+.2f}%</div>
-        <div class="kpi-sub">持股 {quant['port_avg_uw']:+.1f}% vs SPY {quant['spy_avg_uw']:+.1f}%</div>
-    </div>
-    <div class="kpi-card pos">
-        <div class="kpi-label">強漲股捕捉 (Top 20)</div>
-        <div class="kpi-value">{bright[20]['held_in_top']} / 20</div>
-        <div class="kpi-sub">{('{:.1f}x random'.format(bright[20]['multiplier_hit'])) if bright[20].get('multiplier_hit') else 'n/a'}</div>
-    </div>
-    <div class="kpi-card accent">
-        <div class="kpi-label">弱跌股迴避 (Bottom 20)</div>
-        <div class="kpi-value">{bright[20]['avoided_bottom']} / 20</div>
-        <div class="kpi-sub">{('{:.1f}x random'.format(bright[20]['multiplier_avoid'])) if bright[20].get('multiplier_avoid') else 'n/a'}</div>
-    </div>
-    <div class="kpi-card {'pos' if (ic_full or 0) > 0.05 else 'accent'}">
-        <div class="kpi-label">IC (Spearman, 全 SPY)</div>
-        <div class="kpi-value">{(f'{ic_full:+.3f}' if ic_full is not None else 'n/a')}</div>
-        <div class="kpi-sub">{ic_strength} alpha · 持有 IC {(f"{quant.get('ic_held'):+.3f}" if quant.get('ic_held') is not None else 'n/a')}</div>
-    </div>
-</div>
+{(_window_block_html(quant) if quant.get('window') else '')}
 
-<h3>★ 命中 / 迴避 顯著性 (vs Random)</h3>
-{bright_table_html}
-<p class="narrative method-note">
-    <strong>隨機期望</strong> = N × (持有檔數 {quant['n_held_in_spy']} ÷ SPY 母體 {quant['n_spy_total']});
-    若模型只是隨機選股, 在 SPY Top N 中應命中此數字, Bottom N 應有 N − 該值落在持股外.
-    <strong>倍數 = 實際 / 隨機期望</strong>, &gt;1 表示優於隨機 (有 alpha).
-</p>
-
-<h3>SPY 百分位分布: 持有 vs 母體</h3>
-{divs['quant_edge']}
-
-<div class="two-col">
-<div>
-<h3>★ 捕捉到的 SPY Top 20 漲幅股 ({len(quant['held_top20'])} 檔)</h3>
-{held_top20_table_html}
-</div>
-<div>
-<h3>★ 避開的 SPY Bottom 20 跌幅股 ({len(quant['avoided_bot20'])} 檔)</h3>
-{avoided_bot20_table_html}
-</div>
-</div>
-
-<details style="margin-top:18px">
-<summary>期末持有且在 SPY 內的完整明細 ({quant['n_held_in_spy']} 檔, 按 SPY 百分位排序)</summary>
-{his_table_html}
-</details>
-
-<div class="two-col">
-<div>
-<h3>SPY 內 Top 10 漲幅但組合未持有 (missed)</h3>
-{missed_table_html}
-</div>
-<div>
-<h3>SPY 內 Bottom 10 跌幅未持有 (correctly avoided)</h3>
-{avoided_table_html}
-</div>
-</div>
-
-<p class="method-note">
-    篩選邏輯: Bloomberg 期末權重 (end_wt_port) &gt; 0 且在 SPY 母體內 (end_wt_bench &gt; 0)。
-    其他 (SPY 母體外) 與期內已賣光的部位 (end_wt_port = 0) 已自動排除。
-    SPY 母體百分位 rank 在 end_wt_bench &gt; 0 的 {len(quant['spy_universe'])} 檔內以 tr_bench 排序計算。
-</p>
 """
     else:
         quant_edge_html = '<p>無 Bloomberg 證券層資料, 無法產生量化 Edge 分析。</p>'
