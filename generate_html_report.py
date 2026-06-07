@@ -1426,7 +1426,13 @@ def build_html(d, results):
         ('notes', 'Glossary'),
     ]
 
-    plotly_cdn = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>'
+    # Self-contained: 嵌入 Plotly JS, 寄信附件離線可用
+    try:
+        import plotly
+        plotly_cdn = f'<script type="text/javascript">{plotly.offline.get_plotlyjs()}</script>'
+    except Exception:
+        # 退路: 用 CDN
+        plotly_cdn = '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>'
 
     tab_buttons = '\n'.join([
         f'<button class="tab-btn{" active" if i==0 else ""}" data-target="{tid}">{label}</button>'
